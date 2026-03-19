@@ -1,0 +1,252 @@
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sqlx::FromRow;
+use uuid::Uuid;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignedPublicClientSnapshot {
+    pub payload: PublicClientSnapshot,
+    pub signature: String,
+    pub signer_agent_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublicClientSnapshot {
+    pub generated_at: i64,
+    pub node_id: String,
+    pub public_key: String,
+    pub network_status: Value,
+    pub peers: Vec<Value>,
+    pub operator: Value,
+    pub rpc_logs: Vec<Value>,
+    #[serde(default)]
+    pub public_topics: Vec<Value>,
+    #[serde(default)]
+    pub public_topic_messages: Vec<Value>,
+    pub tasks: Vec<Value>,
+    pub organizations: Vec<Value>,
+    pub leaderboard: Vec<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GatewayManifest {
+    pub generated_at: i64,
+    pub gateway_id: String,
+    pub display_name: String,
+    pub base_url: String,
+    pub public_key: String,
+    pub region: Option<String>,
+    pub operator_id: Option<String>,
+    pub roles: Vec<String>,
+    pub supported_endpoints: Vec<String>,
+    pub federation_peers: Vec<String>,
+    pub allows_public_ingest: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignedGatewayManifest {
+    pub payload: GatewayManifest,
+    pub signature: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct NodeSourceRow {
+    pub id: Uuid,
+    pub name: String,
+    pub export_url: String,
+    pub region: Option<String>,
+    pub expected_signer_agent_id: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub last_sync_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_sync_status: Option<String>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct SnapshotRow {
+    pub source_id: Option<Uuid>,
+    pub node_id: String,
+    pub signer_agent_id: String,
+    pub public_key: String,
+    pub generated_at: i64,
+    pub ingested_at: chrono::DateTime<chrono::Utc>,
+    pub payload: sqlx::types::Json<Value>,
+    pub signature: String,
+}
+
+#[derive(Debug, Clone, FromRow)]
+pub struct GatewayRegistryDbRow {
+    pub gateway_id: String,
+    pub display_name: String,
+    pub base_url: String,
+    pub public_key: String,
+    pub region: Option<String>,
+    pub operator_id: Option<String>,
+    pub roles: sqlx::types::Json<Vec<String>>,
+    pub supported_endpoints: sqlx::types::Json<Vec<String>>,
+    pub federation_peers: sqlx::types::Json<Vec<String>>,
+    pub allows_public_ingest: bool,
+    pub manifest_payload: sqlx::types::Json<GatewayManifest>,
+    pub manifest_signature: String,
+    pub status: String,
+    pub discovery_tier: String,
+    pub review_reason: Option<String>,
+    pub reviewed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub reviewed_by: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GatewayRegistryEntry {
+    pub gateway_id: String,
+    pub display_name: String,
+    pub base_url: String,
+    pub public_key: String,
+    pub region: Option<String>,
+    pub operator_id: Option<String>,
+    pub roles: Vec<String>,
+    pub supported_endpoints: Vec<String>,
+    pub federation_peers: Vec<String>,
+    pub allows_public_ingest: bool,
+    pub manifest: GatewayManifest,
+    pub manifest_signature: String,
+    pub status: String,
+    pub discovery_tier: String,
+    pub review_reason: Option<String>,
+    pub reviewed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub reviewed_by: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl From<GatewayRegistryDbRow> for GatewayRegistryEntry {
+    fn from(value: GatewayRegistryDbRow) -> Self {
+        Self {
+            gateway_id: value.gateway_id,
+            display_name: value.display_name,
+            base_url: value.base_url,
+            public_key: value.public_key,
+            region: value.region,
+            operator_id: value.operator_id,
+            roles: value.roles.0,
+            supported_endpoints: value.supported_endpoints.0,
+            federation_peers: value.federation_peers.0,
+            allows_public_ingest: value.allows_public_ingest,
+            manifest: value.manifest_payload.0,
+            manifest_signature: value.manifest_signature,
+            status: value.status,
+            discovery_tier: value.discovery_tier,
+            review_reason: value.review_reason,
+            reviewed_at: value.reviewed_at,
+            reviewed_by: value.reviewed_by,
+            created_at: value.created_at,
+            updated_at: value.updated_at,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RegisterNodeRequest {
+    pub name: String,
+    pub export_url: String,
+    pub region: Option<String>,
+    pub expected_signer_agent_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RegisterNodeResponse {
+    pub source_id: Uuid,
+    pub name: String,
+    pub export_url: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SyncRequest {
+    pub source_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SyncResult {
+    pub source_id: Option<Uuid>,
+    pub node_id: String,
+    pub signer_agent_id: String,
+    pub generated_at: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ListQuery {
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TopicQuery {
+    pub limit: Option<usize>,
+    pub topic_id: Option<String>,
+    pub organization_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TopicMessageQuery {
+    pub limit: Option<usize>,
+    pub topic_id: Option<String>,
+    pub organization_id: Option<String>,
+    pub author_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisterGatewayRequest {
+    pub manifest: SignedGatewayManifest,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisterGatewayResponse {
+    pub gateway_id: String,
+    pub status: String,
+    pub discovery_tier: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SelfRegisterGatewayRequest {
+    pub registry_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SelfRegisterGatewayResponse {
+    pub registry_url: String,
+    pub gateway_id: String,
+    pub status: String,
+    pub discovery_tier: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SelfRegisterGatewayBatchResponse {
+    pub results: Vec<SelfRegisterGatewayResponse>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BootstrapRegistryEntry {
+    pub registry_url: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DiscoveredGatewayEntry {
+    pub source_registry_url: String,
+    pub gateway: GatewayRegistryEntry,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GatewayRegistryQuery {
+    pub region: Option<String>,
+    pub tier: Option<String>,
+    pub role: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReviewGatewayRequest {
+    pub status: String,
+    pub discovery_tier: Option<String>,
+    pub reason: Option<String>,
+    pub reviewed_by: Option<String>,
+}

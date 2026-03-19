@@ -1,0 +1,1086 @@
+use axum::body::{Body, to_bytes};
+use axum::http::{Request, StatusCode};
+use axum::{Json, Router, routing::get};
+use base64::Engine as _;
+use ed25519_dalek::{Signer, SigningKey};
+use serde_json::{Value, json};
+use sqlx::ConnectOptions;
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+use std::net::SocketAddr;
+use std::process::Command;
+use std::str::FromStr;
+use std::sync::OnceLock;
+use tower::util::ServiceExt;
+use wattetheria_gateway::db::{self, UpsertSnapshotRecord};
+use wattetheria_gateway::gateway_identity::{GatewayIdentity, GatewayIdentityConfig};
+use wattetheria_gateway::http;
+use wattetheria_gateway::models::{
+    GatewayManifest, PublicClientSnapshot, SignedGatewayManifest, SignedPublicClientSnapshot,
+};
+use wattetheria_gateway::node_client::NodeClient;
+use wattetheria_gateway::registry_client::RegistryClient;
+use wattetheria_gateway::state::AppState;
+use wattetheria_gateway::verify::{canonical_bytes, verify_signed_gateway_manifest};
+
+static POSTGRES_READY: OnceLock<()> = OnceLock::new();
+
+#[tokio::test]
+async fn register_and_sync_ingests_snapshot_and_aggregates() {
+    let db = TestDatabase::new().await;
+    let export_server = MockExportServer::spawn(signed_snapshot(
+        "node-alpha",
+        SnapshotContents {
+            peers: &[json!({"id":"peer-1"}), json!({"id":"peer-2"})],
+            public_topics: &[json!({
+                "topic_id":"topic-public-1",
+                "organization_id":"org-1",
+                "title":"Aurora Ops",
+                "last_message_at":"2026-03-18T01:00:00Z"
+            })],
+            public_topic_messages: &[json!({
+                "message_id":"msg-1",
+                "topic_id":"topic-public-1",
+                "organization_id":"org-1",
+                "author_id":"agent-1",
+                "body":"Relay stable",
+                "created_at":"2026-03-18T01:00:00Z"
+            })],
+            tasks: &[json!({"id":"task-1","title":"Relay Repair"})],
+            organizations: &[json!({"id":"org-1","name":"Aurora Guild"})],
+            leaderboard: &[json!({"agent_id":"agent-1","score":9})],
+        },
+    ))
+    .await;
+    let app = test_app(&db.database_url).await;
+
+    let register = request_json(
+        &app,
+        "POST",
+        "/api/nodes/register",
+        json!({
+            "name": "alpha",
+            "export_url": export_server.export_url(),
+            "region": "ap-southeast"
+        }),
+    )
+    .await;
+    assert_eq!(register.0, StatusCode::CREATED);
+
+    let sync = request_json(&app, "POST", "/api/nodes/sync", json!({})).await;
+    assert_eq!(sync.0, StatusCode::OK);
+    assert_eq!(sync.1.as_array().unwrap().len(), 1);
+    assert_eq!(sync.1[0]["node_id"].as_str(), Some("node-alpha"));
+
+    let nodes = request(&app, "GET", "/api/nodes").await;
+    assert_eq!(nodes.0, StatusCode::OK);
+    assert_eq!(nodes.1.as_array().unwrap().len(), 1);
+    assert_eq!(nodes.1[0]["last_sync_status"].as_str(), Some("ok"));
+    assert_eq!(
+        nodes.1[0]["snapshot"]["node_id"].as_str(),
+        Some("node-alpha")
+    );
+
+    let network_status = request(&app, "GET", "/api/network/status").await;
+    assert_eq!(network_status.0, StatusCode::OK);
+    assert_eq!(network_status.1["nodes"].as_u64(), Some(1));
+    assert_eq!(network_status.1["peers"].as_u64(), Some(2));
+    assert_eq!(network_status.1["tasks"].as_u64(), Some(1));
+    assert_eq!(network_status.1["organizations"].as_u64(), Some(1));
+    assert_eq!(network_status.1["topics"].as_u64(), Some(1));
+    assert_eq!(network_status.1["topic_messages"].as_u64(), Some(1));
+
+    let peers = request(&app, "GET", "/api/peers?limit=10").await;
+    assert_eq!(peers.0, StatusCode::OK);
+    assert_eq!(peers.1.as_array().unwrap().len(), 2);
+    assert_eq!(peers.1[0]["source_node_id"].as_str(), Some("node-alpha"));
+
+    let topics = request(&app, "GET", "/api/topics?limit=10").await;
+    assert_eq!(topics.0, StatusCode::OK);
+    assert_eq!(topics.1.as_array().unwrap().len(), 1);
+    assert_eq!(topics.1[0]["source_node_id"].as_str(), Some("node-alpha"));
+
+    let topic_messages = request(&app, "GET", "/api/topic-messages?limit=10").await;
+    assert_eq!(topic_messages.0, StatusCode::OK);
+    assert_eq!(topic_messages.1.as_array().unwrap().len(), 1);
+    assert_eq!(
+        topic_messages.1[0]["topic_id"].as_str(),
+        Some("topic-public-1")
+    );
+
+    let tasks = request(&app, "GET", "/api/tasks?limit=10").await;
+    assert_eq!(tasks.0, StatusCode::OK);
+    assert_eq!(tasks.1.as_array().unwrap().len(), 1);
+    assert_eq!(tasks.1[0]["source_node_id"].as_str(), Some("node-alpha"));
+
+    let organizations = request(&app, "GET", "/api/organizations?limit=10").await;
+    assert_eq!(organizations.0, StatusCode::OK);
+    assert_eq!(organizations.1.as_array().unwrap().len(), 1);
+
+    let leaderboard = request(&app, "GET", "/api/leaderboard?limit=10").await;
+    assert_eq!(leaderboard.0, StatusCode::OK);
+    assert_eq!(leaderboard.1.as_array().unwrap().len(), 1);
+
+    drop(app);
+    export_server.abort();
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn sync_rejects_invalid_signature_and_marks_source_invalid() {
+    let db = TestDatabase::new().await;
+    let mut invalid = signed_snapshot(
+        "node-invalid",
+        SnapshotContents {
+            peers: &[],
+            public_topics: &[],
+            public_topic_messages: &[],
+            tasks: &[json!({"id":"task-bad"})],
+            organizations: &[],
+            leaderboard: &[],
+        },
+    );
+    invalid.signature = "corrupted-signature".to_string();
+    let export_server = MockExportServer::spawn(invalid).await;
+    let app = test_app(&db.database_url).await;
+
+    let register = request_json(
+        &app,
+        "POST",
+        "/api/nodes/register",
+        json!({
+            "name": "invalid",
+            "export_url": export_server.export_url()
+        }),
+    )
+    .await;
+    assert_eq!(register.0, StatusCode::CREATED);
+
+    let sync = request_json(&app, "POST", "/api/nodes/sync", json!({})).await;
+    assert_eq!(sync.0, StatusCode::BAD_REQUEST);
+
+    let nodes = request(&app, "GET", "/api/nodes").await;
+    assert_eq!(nodes.0, StatusCode::OK);
+    assert_eq!(nodes.1[0]["last_sync_status"].as_str(), Some("invalid"));
+    assert!(nodes.1[0]["last_error"].as_str().is_some());
+
+    drop(app);
+    export_server.abort();
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn upsert_snapshot_replaces_existing_snapshot_for_same_source() {
+    let db = TestDatabase::new().await;
+    let pool = db.pool().await;
+    db::init_schema(&pool).await.unwrap();
+    let source_id = uuid::Uuid::new_v4();
+    db::insert_node_source(
+        &pool,
+        source_id,
+        "source-a",
+        "http://127.0.0.1:7777/v1/client/export",
+        Some("test"),
+        None,
+    )
+    .await
+    .unwrap();
+
+    let first = json!({
+        "generated_at": 1,
+        "node_id": "node-a",
+        "public_key": "pub-a",
+        "network_status": {},
+        "peers": [],
+        "operator": {},
+        "rpc_logs": [],
+        "tasks": [{"id":"task-1"}],
+        "organizations": [],
+        "leaderboard": [],
+    });
+    db::upsert_snapshot(
+        &pool,
+        UpsertSnapshotRecord {
+            source_id: Some(source_id),
+            node_id: "node-a",
+            signer_agent_id: "pub-a",
+            public_key: "pub-a",
+            generated_at: 1,
+            payload: &first,
+            signature: "sig-1",
+        },
+    )
+    .await
+    .unwrap();
+
+    let second = json!({
+        "generated_at": 2,
+        "node_id": "node-a",
+        "public_key": "pub-a",
+        "network_status": {},
+        "peers": [],
+        "operator": {},
+        "rpc_logs": [],
+        "tasks": [{"id":"task-2"}],
+        "organizations": [],
+        "leaderboard": [],
+    });
+    db::upsert_snapshot(
+        &pool,
+        UpsertSnapshotRecord {
+            source_id: Some(source_id),
+            node_id: "node-a",
+            signer_agent_id: "pub-a",
+            public_key: "pub-a",
+            generated_at: 2,
+            payload: &second,
+            signature: "sig-2",
+        },
+    )
+    .await
+    .unwrap();
+
+    let snapshots = db::list_snapshots(&pool).await.unwrap();
+    assert_eq!(snapshots.len(), 1);
+    assert_eq!(snapshots[0].generated_at, 2);
+    assert_eq!(snapshots[0].signature, "sig-2");
+    assert_eq!(
+        snapshots[0].payload.0["tasks"][0]["id"].as_str(),
+        Some("task-2")
+    );
+
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn ingest_snapshot_accepts_push_without_registered_source() {
+    let db = TestDatabase::new().await;
+    let app = test_app(&db.database_url).await;
+    let snapshot = signed_snapshot(
+        "node-push",
+        SnapshotContents {
+            peers: &[json!({"id":"peer-9"})],
+            public_topics: &[json!({"topic_id":"topic-9","title":"Public Topic 9"})],
+            public_topic_messages: &[
+                json!({"message_id":"msg-9","topic_id":"topic-9","body":"hello"}),
+            ],
+            tasks: &[json!({"id":"task-9"})],
+            organizations: &[json!({"id":"org-9"})],
+            leaderboard: &[json!({"agent_id":"agent-9","score":99})],
+        },
+    );
+
+    let ingest = request_json(
+        &app,
+        "POST",
+        "/api/ingest/snapshot",
+        serde_json::to_value(&snapshot).unwrap(),
+    )
+    .await;
+    assert_eq!(ingest.0, StatusCode::OK);
+    assert_eq!(ingest.1["node_id"].as_str(), Some("node-push"));
+
+    let nodes = request(&app, "GET", "/api/nodes").await;
+    assert_eq!(nodes.0, StatusCode::OK);
+    assert_eq!(nodes.1.as_array().unwrap().len(), 1);
+    assert_eq!(nodes.1[0]["last_sync_status"].as_str(), Some("push"));
+    assert_eq!(
+        nodes.1[0]["snapshot"]["node_id"].as_str(),
+        Some("node-push")
+    );
+
+    let network_status = request(&app, "GET", "/api/network/status").await;
+    assert_eq!(network_status.1["nodes"].as_u64(), Some(1));
+
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn public_topics_and_messages_are_deduped_sorted_and_filterable() {
+    let db = TestDatabase::new().await;
+    let app = test_app(&db.database_url).await;
+    let first = signed_snapshot(
+        "node-alpha",
+        SnapshotContents {
+            peers: &[],
+            public_topics: &[json!({
+                "topic_id":"topic-a",
+                "organization_id":"org-1",
+                "title":"Ops",
+                "last_message_at":"2026-03-18T02:00:00Z"
+            })],
+            public_topic_messages: &[json!({
+                "message_id":"msg-a",
+                "topic_id":"topic-a",
+                "organization_id":"org-1",
+                "author_id":"agent-1",
+                "body":"first",
+                "created_at":"2026-03-18T02:00:00Z"
+            })],
+            tasks: &[],
+            organizations: &[],
+            leaderboard: &[],
+        },
+    );
+    let second = signed_snapshot(
+        "node-beta",
+        SnapshotContents {
+            peers: &[],
+            public_topics: &[
+                json!({
+                    "topic_id":"topic-a",
+                    "organization_id":"org-1",
+                    "title":"Ops duplicate",
+                    "last_message_at":"2026-03-18T01:00:00Z"
+                }),
+                json!({
+                    "topic_id":"topic-b",
+                    "organization_id":"org-2",
+                    "title":"Travel",
+                    "last_message_at":"2026-03-18T03:00:00Z"
+                }),
+            ],
+            public_topic_messages: &[
+                json!({
+                    "message_id":"msg-a",
+                    "topic_id":"topic-a",
+                    "organization_id":"org-1",
+                    "author_id":"agent-1",
+                    "body":"first",
+                    "created_at":"2026-03-18T02:00:00Z"
+                }),
+                json!({
+                    "message_id":"msg-b",
+                    "topic_id":"topic-b",
+                    "organization_id":"org-2",
+                    "author_id":"agent-2",
+                    "body":"second",
+                    "created_at":"2026-03-18T03:00:00Z"
+                }),
+            ],
+            tasks: &[],
+            organizations: &[],
+            leaderboard: &[],
+        },
+    );
+
+    let ingest_first = request_json(
+        &app,
+        "POST",
+        "/api/ingest/snapshot",
+        serde_json::to_value(&first).unwrap(),
+    )
+    .await;
+    assert_eq!(ingest_first.0, StatusCode::OK);
+
+    let ingest_second = request_json(
+        &app,
+        "POST",
+        "/api/ingest/snapshot",
+        serde_json::to_value(&second).unwrap(),
+    )
+    .await;
+    assert_eq!(ingest_second.0, StatusCode::OK);
+
+    let topics = request(&app, "GET", "/api/topics?limit=10").await;
+    assert_eq!(topics.0, StatusCode::OK);
+    assert_eq!(topics.1.as_array().unwrap().len(), 2);
+    assert_eq!(topics.1[0]["topic_id"].as_str(), Some("topic-b"));
+    assert_eq!(topics.1[1]["topic_id"].as_str(), Some("topic-a"));
+
+    let filtered_topics = request(&app, "GET", "/api/topics?organization_id=org-1").await;
+    assert_eq!(filtered_topics.0, StatusCode::OK);
+    assert_eq!(filtered_topics.1.as_array().unwrap().len(), 1);
+    assert_eq!(filtered_topics.1[0]["topic_id"].as_str(), Some("topic-a"));
+
+    let messages = request(&app, "GET", "/api/topic-messages?limit=10").await;
+    assert_eq!(messages.0, StatusCode::OK);
+    assert_eq!(messages.1.as_array().unwrap().len(), 2);
+    assert_eq!(messages.1[0]["message_id"].as_str(), Some("msg-b"));
+    assert_eq!(messages.1[1]["message_id"].as_str(), Some("msg-a"));
+
+    let filtered_messages = request(&app, "GET", "/api/topic-messages?topic_id=topic-a").await;
+    assert_eq!(filtered_messages.0, StatusCode::OK);
+    assert_eq!(filtered_messages.1.as_array().unwrap().len(), 1);
+    assert_eq!(filtered_messages.1[0]["message_id"].as_str(), Some("msg-a"));
+
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn older_snapshot_does_not_replace_newer_snapshot() {
+    let db = TestDatabase::new().await;
+    let app = test_app(&db.database_url).await;
+    let newer = signed_snapshot_at(
+        "node-stable",
+        1_710_000_100,
+        SnapshotContents {
+            peers: &[],
+            public_topics: &[],
+            public_topic_messages: &[],
+            tasks: &[json!({"id":"task-new"})],
+            organizations: &[],
+            leaderboard: &[],
+        },
+    );
+    let older = signed_snapshot_at(
+        "node-stable",
+        1_710_000_090,
+        SnapshotContents {
+            peers: &[],
+            public_topics: &[],
+            public_topic_messages: &[],
+            tasks: &[json!({"id":"task-old"})],
+            organizations: &[],
+            leaderboard: &[],
+        },
+    );
+
+    let ingest_newer = request_json(
+        &app,
+        "POST",
+        "/api/ingest/snapshot",
+        serde_json::to_value(&newer).unwrap(),
+    )
+    .await;
+    assert_eq!(ingest_newer.0, StatusCode::OK);
+
+    let stale = request_json(
+        &app,
+        "POST",
+        "/api/ingest/snapshot",
+        serde_json::to_value(&older).unwrap(),
+    )
+    .await;
+    assert_eq!(stale.0, StatusCode::OK);
+
+    let tasks = request(&app, "GET", "/api/tasks?limit=10").await;
+    assert_eq!(tasks.0, StatusCode::OK);
+    assert_eq!(tasks.1[0]["id"].as_str(), Some("task-new"));
+
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn gateway_registry_requires_review_before_public_discovery() {
+    let db = TestDatabase::new().await;
+    let app = test_app(&db.database_url).await;
+    let manifest = signed_gateway_manifest("gw-ap-1", "https://gw-ap.example", "ap-southeast");
+
+    let register = request_json(
+        &app,
+        "POST",
+        "/api/registry/gateways/register",
+        json!({ "manifest": manifest }),
+    )
+    .await;
+    assert_eq!(register.0, StatusCode::CREATED);
+    assert_eq!(register.1["status"].as_str(), Some("pending"));
+
+    let public_list = request(&app, "GET", "/api/registry/gateways").await;
+    assert_eq!(public_list.0, StatusCode::OK);
+    assert_eq!(public_list.1.as_array().unwrap().len(), 0);
+
+    let review = request_json_with_auth(
+        &app,
+        "POST",
+        "/api/admin/registry/gateways/gw-ap-1/review",
+        json!({
+            "status": "approved",
+            "discovery_tier": "verified",
+            "reason": "meets uptime and signature requirements",
+            "reviewed_by": "registry-operator"
+        }),
+        Some("registry-secret"),
+    )
+    .await;
+    assert_eq!(review.0, StatusCode::OK);
+    assert_eq!(review.1["status"].as_str(), Some("approved"));
+    assert_eq!(review.1["discovery_tier"].as_str(), Some("verified"));
+
+    let public_list = request(&app, "GET", "/api/registry/gateways").await;
+    assert_eq!(public_list.0, StatusCode::OK);
+    assert_eq!(public_list.1.as_array().unwrap().len(), 1);
+    assert_eq!(public_list.1[0]["gateway_id"].as_str(), Some("gw-ap-1"));
+
+    let detail = request(&app, "GET", "/api/registry/gateways/gw-ap-1").await;
+    assert_eq!(detail.0, StatusCode::OK);
+    assert_eq!(detail.1["base_url"].as_str(), Some("https://gw-ap.example"));
+
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn gateway_registry_review_requires_admin_token() {
+    let db = TestDatabase::new().await;
+    let app = test_app(&db.database_url).await;
+    let manifest = signed_gateway_manifest("gw-us-1", "https://gw-us.example", "us-east");
+
+    let register = request_json(
+        &app,
+        "POST",
+        "/api/registry/gateways/register",
+        json!({ "manifest": manifest }),
+    )
+    .await;
+    assert_eq!(register.0, StatusCode::CREATED);
+
+    let unauthorized = request_json(
+        &app,
+        "POST",
+        "/api/admin/registry/gateways/gw-us-1/review",
+        json!({
+            "status": "approved",
+            "discovery_tier": "official"
+        }),
+    )
+    .await;
+    assert_eq!(unauthorized.0, StatusCode::UNAUTHORIZED);
+
+    let forbidden = request_json_with_auth(
+        &app,
+        "POST",
+        "/api/admin/registry/gateways/gw-us-1/review",
+        json!({
+            "status": "approved",
+            "discovery_tier": "official"
+        }),
+        Some("wrong-secret"),
+    )
+    .await;
+    assert_eq!(forbidden.0, StatusCode::FORBIDDEN);
+
+    let pending = request_json_with_auth(
+        &app,
+        "GET",
+        "/api/admin/registry/gateways",
+        Value::Null,
+        Some("registry-secret"),
+    )
+    .await;
+    assert_eq!(pending.0, StatusCode::OK);
+    assert_eq!(pending.1.as_array().unwrap().len(), 1);
+    assert_eq!(pending.1[0]["status"].as_str(), Some("pending"));
+
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn self_manifest_endpoint_returns_signed_manifest_when_identity_is_configured() {
+    let db = TestDatabase::new().await;
+    let app = test_app_with_identity(&db.database_url).await;
+
+    let response = request(&app, "GET", "/api/registry/self-manifest").await;
+    assert_eq!(response.0, StatusCode::OK);
+
+    let manifest: SignedGatewayManifest = serde_json::from_value(response.1).unwrap();
+    assert_eq!(manifest.payload.gateway_id, "gw-self-1");
+    assert_eq!(manifest.payload.base_url, "https://gateway.self.example");
+    verify_signed_gateway_manifest(&manifest).unwrap();
+
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn self_register_posts_manifest_to_remote_registry() {
+    let db = TestDatabase::new().await;
+    let app = test_app_with_identity(&db.database_url).await;
+    let received = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
+    let registry_app = Router::new().route(
+        "/api/registry/gateways/register",
+        axum::routing::post({
+            let received = std::sync::Arc::clone(&received);
+            move |Json(payload): Json<Value>| {
+                let received = std::sync::Arc::clone(&received);
+                async move {
+                    received.lock().await.push(payload.clone());
+                    Json(json!({
+                        "gateway_id": "gw-self-1",
+                        "status": "pending",
+                        "discovery_tier": "community"
+                    }))
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, registry_app).await.unwrap();
+    });
+
+    let response = request_json(
+        &app,
+        "POST",
+        "/api/registry/self-register",
+        json!({
+            "registry_url": format!("http://{addr}")
+        }),
+    )
+    .await;
+    assert_eq!(response.0, StatusCode::OK);
+    assert_eq!(response.1["results"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        response.1["results"][0]["gateway_id"].as_str(),
+        Some("gw-self-1")
+    );
+    assert_eq!(
+        response.1["results"][0]["registry_url"].as_str(),
+        Some(format!("http://{addr}/api/registry/gateways/register").as_str())
+    );
+
+    let received = received.lock().await;
+    assert_eq!(received.len(), 1);
+    let manifest: SignedGatewayManifest =
+        serde_json::from_value(received[0]["manifest"].clone()).unwrap();
+    assert_eq!(manifest.payload.gateway_id, "gw-self-1");
+    verify_signed_gateway_manifest(&manifest).unwrap();
+
+    server.abort();
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn bootstrap_registry_list_and_discovery_aggregate_upstreams() {
+    let db = TestDatabase::new().await;
+    let received = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
+    let registry_app = Router::new()
+        .route(
+            "/api/registry/gateways",
+            get(|| async move {
+                Json(vec![json!({
+                    "gateway_id": "gw-remote-1",
+                    "display_name": "Remote Gateway",
+                    "base_url": "https://gw-remote.example",
+                    "public_key": "remote-pub",
+                    "region": "eu-west",
+                    "operator_id": "operator-remote",
+                    "roles": ["query", "federation"],
+                    "supported_endpoints": ["/api/network/status"],
+                    "federation_peers": [],
+                    "allows_public_ingest": true,
+                    "manifest": {
+                        "generated_at": 1710000000i64,
+                        "gateway_id": "gw-remote-1",
+                        "display_name": "Remote Gateway",
+                        "base_url": "https://gw-remote.example",
+                        "public_key": "remote-pub",
+                        "region": "eu-west",
+                        "operator_id": "operator-remote",
+                        "roles": ["query", "federation"],
+                        "supported_endpoints": ["/api/network/status"],
+                        "federation_peers": [],
+                        "allows_public_ingest": true
+                    },
+                    "manifest_signature": "remote-sig",
+                    "status": "approved",
+                    "discovery_tier": "verified",
+                    "review_reason": null,
+                    "reviewed_at": null,
+                    "reviewed_by": null,
+                    "created_at": "2026-03-19T00:00:00Z",
+                    "updated_at": "2026-03-19T00:00:00Z"
+                })])
+            }),
+        )
+        .route(
+            "/api/registry/gateways/register",
+            axum::routing::post({
+                let received = std::sync::Arc::clone(&received);
+                move |Json(payload): Json<Value>| {
+                    let received = std::sync::Arc::clone(&received);
+                    async move {
+                        received.lock().await.push(payload.clone());
+                        Json(json!({
+                            "gateway_id": "gw-self-1",
+                            "status": "pending",
+                            "discovery_tier": "community"
+                        }))
+                    }
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, registry_app).await.unwrap();
+    });
+    let app =
+        test_app_with_identity_and_bootstrap(&db.database_url, vec![format!("http://{addr}")])
+            .await;
+
+    let bootstrap = request(&app, "GET", "/api/registry/bootstrap").await;
+    assert_eq!(bootstrap.0, StatusCode::OK);
+    assert_eq!(bootstrap.1.as_array().unwrap().len(), 1);
+
+    let self_register = request_json(&app, "POST", "/api/registry/self-register", json!({})).await;
+    assert_eq!(self_register.0, StatusCode::OK);
+    assert_eq!(self_register.1["results"].as_array().unwrap().len(), 1);
+
+    let discovery = request(&app, "GET", "/api/registry/discovery").await;
+    assert_eq!(discovery.0, StatusCode::OK);
+    assert_eq!(discovery.1.as_array().unwrap().len(), 1);
+    assert_eq!(
+        discovery.1[0]["source_registry_url"].as_str(),
+        Some(format!("http://{addr}/api/registry/gateways").as_str())
+    );
+    assert_eq!(
+        discovery.1[0]["gateway"]["gateway_id"].as_str(),
+        Some("gw-remote-1")
+    );
+
+    server.abort();
+    db.cleanup().await;
+}
+
+async fn test_app(database_url: &str) -> Router {
+    let pool = db::connect(database_url).await.unwrap();
+    db::init_schema(&pool).await.unwrap();
+    http::router(AppState {
+        pool,
+        node_client: NodeClient::new(5).unwrap(),
+        registry_client: RegistryClient::new(5).unwrap(),
+        nats: None,
+        registry_admin_token: Some("registry-secret".to_string()),
+        bootstrap_registry_urls: Vec::new(),
+        gateway_identity: None,
+    })
+}
+
+async fn test_app_with_identity(database_url: &str) -> Router {
+    let pool = db::connect(database_url).await.unwrap();
+    db::init_schema(&pool).await.unwrap();
+    let gateway_identity = GatewayIdentity::from_config(GatewayIdentityConfig {
+        gateway_id: Some("gw-self-1".to_string()),
+        display_name: Some("Self Gateway".to_string()),
+        base_url: Some("https://gateway.self.example".to_string()),
+        region: Some("ap-southeast".to_string()),
+        operator_id: Some("operator-self".to_string()),
+        roles: vec!["ingest".to_string(), "query".to_string()],
+        supported_endpoints: vec!["/api/network/status".to_string()],
+        federation_peers: vec!["https://gw-us.example".to_string()],
+        allows_public_ingest: true,
+        signing_key_b64: Some(base64::engine::general_purpose::STANDARD.encode([21_u8; 32])),
+    })
+    .unwrap();
+    http::router(AppState {
+        pool,
+        node_client: NodeClient::new(5).unwrap(),
+        registry_client: RegistryClient::new(5).unwrap(),
+        nats: None,
+        registry_admin_token: Some("registry-secret".to_string()),
+        bootstrap_registry_urls: Vec::new(),
+        gateway_identity,
+    })
+}
+
+async fn test_app_with_identity_and_bootstrap(
+    database_url: &str,
+    bootstrap_registry_urls: Vec<String>,
+) -> Router {
+    let pool = db::connect(database_url).await.unwrap();
+    db::init_schema(&pool).await.unwrap();
+    let gateway_identity = GatewayIdentity::from_config(GatewayIdentityConfig {
+        gateway_id: Some("gw-self-1".to_string()),
+        display_name: Some("Self Gateway".to_string()),
+        base_url: Some("https://gateway.self.example".to_string()),
+        region: Some("ap-southeast".to_string()),
+        operator_id: Some("operator-self".to_string()),
+        roles: vec!["ingest".to_string(), "query".to_string()],
+        supported_endpoints: vec!["/api/network/status".to_string()],
+        federation_peers: vec!["https://gw-us.example".to_string()],
+        allows_public_ingest: true,
+        signing_key_b64: Some(base64::engine::general_purpose::STANDARD.encode([21_u8; 32])),
+    })
+    .unwrap();
+    http::router(AppState {
+        pool,
+        node_client: NodeClient::new(5).unwrap(),
+        registry_client: RegistryClient::new(5).unwrap(),
+        nats: None,
+        registry_admin_token: Some("registry-secret".to_string()),
+        bootstrap_registry_urls,
+        gateway_identity,
+    })
+}
+
+async fn request(app: &Router, method: &str, uri: &str) -> (StatusCode, Value) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    (status, serde_json::from_slice(&body).unwrap())
+}
+
+async fn request_json(app: &Router, method: &str, uri: &str, body: Value) -> (StatusCode, Value) {
+    request_json_with_auth(app, method, uri, body, None).await
+}
+
+async fn request_json_with_auth(
+    app: &Router,
+    method: &str,
+    uri: &str,
+    body: Value,
+    bearer_token: Option<&str>,
+) -> (StatusCode, Value) {
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("content-type", "application/json");
+    if let Some(token) = bearer_token {
+        builder = builder.header("authorization", format!("Bearer {token}"));
+    }
+    let response = app
+        .clone()
+        .oneshot(builder.body(Body::from(body.to_string())).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    (status, serde_json::from_slice(&body).unwrap())
+}
+
+struct MockExportServer {
+    addr: SocketAddr,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl MockExportServer {
+    async fn spawn(snapshot: SignedPublicClientSnapshot) -> Self {
+        let app = Router::new().route(
+            "/v1/client/export",
+            get({
+                let snapshot = snapshot.clone();
+                move || async move { Json(snapshot.clone()) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let export_url = format!("http://{addr}/v1/client/export");
+        let client = reqwest::Client::new();
+        for _ in 0..20 {
+            if client.get(&export_url).send().await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        Self { addr, task }
+    }
+
+    fn export_url(&self) -> String {
+        format!("http://{}/v1/client/export", self.addr)
+    }
+
+    fn abort(self) {
+        self.task.abort();
+    }
+}
+
+struct TestDatabase {
+    database_url: String,
+    admin_url: String,
+    database_name: String,
+}
+
+impl TestDatabase {
+    async fn new() -> Self {
+        ensure_postgres().await;
+        let base_url = test_database_url();
+        let admin_url = admin_database_url(&base_url);
+        let database_name = format!("wattetheria_gateway_test_{}", uuid::Uuid::new_v4().simple());
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&admin_url)
+            .await
+            .unwrap();
+        sqlx::query(&format!(r#"create database "{}""#, database_name))
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+        Self {
+            database_url: database_url_for_name(&base_url, &database_name),
+            admin_url,
+            database_name,
+        }
+    }
+
+    async fn pool(&self) -> sqlx::PgPool {
+        db::connect(&self.database_url).await.unwrap()
+    }
+
+    async fn cleanup(self) {
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&self.admin_url)
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"
+            select pg_terminate_backend(pid)
+            from pg_stat_activity
+            where datname = $1 and pid <> pg_backend_pid()
+            "#,
+        )
+        .bind(&self.database_name)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(&format!(
+            r#"drop database if exists "{}""#,
+            self.database_name
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+    }
+}
+
+async fn ensure_postgres() {
+    POSTGRES_READY.get_or_init(|| {
+        let status = Command::new("docker")
+            .args(["compose", "up", "-d", "postgres"])
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .status()
+            .expect("run docker compose up -d postgres");
+        assert!(status.success(), "postgres compose service failed to start");
+    });
+
+    let admin_url = admin_database_url(&test_database_url());
+    for _ in 0..30 {
+        if PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&admin_url)
+            .await
+            .is_ok()
+        {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    panic!("postgres test dependency did not become ready");
+}
+
+fn test_database_url() -> String {
+    std::env::var("WATTETHERIA_GATEWAY_TEST_DATABASE_URL").unwrap_or_else(|_| {
+        "postgres://postgres:postgres@127.0.0.1:55433/wattetheria_gateway".to_string()
+    })
+}
+
+fn database_url_for_name(base_url: &str, database_name: &str) -> String {
+    let mut options = PgConnectOptions::from_str(base_url).unwrap();
+    options = options.database(database_name);
+    options.to_url_lossy().to_string()
+}
+
+fn admin_database_url(base_url: &str) -> String {
+    let mut options = PgConnectOptions::from_str(base_url).unwrap();
+    options = options.database("postgres");
+    options.to_url_lossy().to_string()
+}
+
+struct SnapshotContents<'a> {
+    peers: &'a [Value],
+    public_topics: &'a [Value],
+    public_topic_messages: &'a [Value],
+    tasks: &'a [Value],
+    organizations: &'a [Value],
+    leaderboard: &'a [Value],
+}
+
+fn signed_snapshot(node_id: &str, contents: SnapshotContents<'_>) -> SignedPublicClientSnapshot {
+    signed_snapshot_at(node_id, 1_710_000_000, contents)
+}
+
+fn signed_snapshot_at(
+    node_id: &str,
+    generated_at: i64,
+    contents: SnapshotContents<'_>,
+) -> SignedPublicClientSnapshot {
+    let signing_key = SigningKey::from_bytes(&[11_u8; 32]);
+    let public_key =
+        base64::engine::general_purpose::STANDARD.encode(signing_key.verifying_key().as_bytes());
+    let payload = PublicClientSnapshot {
+        generated_at,
+        node_id: node_id.to_string(),
+        public_key: public_key.clone(),
+        network_status: json!({
+            "total_nodes": contents.peers.len() + 1,
+            "active_nodes": contents.peers.len() + 1,
+            "health_percent": 100,
+            "avg_latency_ms": 0
+        }),
+        peers: contents.peers.to_vec(),
+        operator: json!({
+            "id": "agent-root",
+            "display_name": "Agent Root",
+            "watt_balance": 42
+        }),
+        rpc_logs: vec![
+            json!({"timestamp":"2026-03-18T00:00:00Z","message":"Agent connected","level":"success"}),
+        ],
+        public_topics: contents.public_topics.to_vec(),
+        public_topic_messages: contents.public_topic_messages.to_vec(),
+        tasks: contents.tasks.to_vec(),
+        organizations: contents.organizations.to_vec(),
+        leaderboard: contents.leaderboard.to_vec(),
+    };
+    let signature = base64::engine::general_purpose::STANDARD.encode(
+        signing_key
+            .sign(&canonical_bytes(&payload).unwrap())
+            .to_bytes(),
+    );
+    SignedPublicClientSnapshot {
+        payload,
+        signature,
+        signer_agent_id: public_key,
+    }
+}
+
+fn signed_gateway_manifest(
+    gateway_id: &str,
+    base_url: &str,
+    region: &str,
+) -> SignedGatewayManifest {
+    let signing_key = SigningKey::from_bytes(&[13_u8; 32]);
+    let public_key =
+        base64::engine::general_purpose::STANDARD.encode(signing_key.verifying_key().as_bytes());
+    let payload = GatewayManifest {
+        generated_at: 1_710_000_000,
+        gateway_id: gateway_id.to_string(),
+        display_name: format!("Gateway {gateway_id}"),
+        base_url: base_url.to_string(),
+        public_key,
+        region: Some(region.to_string()),
+        operator_id: Some("operator-root".to_string()),
+        roles: vec![
+            "ingest".to_string(),
+            "query".to_string(),
+            "federation".to_string(),
+        ],
+        supported_endpoints: vec![
+            "/api/network/status".to_string(),
+            "/api/registry/gateways".to_string(),
+        ],
+        federation_peers: vec![],
+        allows_public_ingest: true,
+    };
+    let signature = base64::engine::general_purpose::STANDARD.encode(
+        signing_key
+            .sign(&canonical_bytes(&payload).unwrap())
+            .to_bytes(),
+    );
+    SignedGatewayManifest { payload, signature }
+}

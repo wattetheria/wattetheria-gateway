@@ -1,0 +1,47 @@
+services:
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      WATTETHERIA_GATEWAY_BIND: 0.0.0.0:8080
+      WATTETHERIA_GATEWAY_DATABASE_URL: postgres://postgres:postgres@postgres:5432/wattetheria_gateway
+      WATTETHERIA_GATEWAY_NATS_URL: nats://nats:4222
+      WATTETHERIA_GATEWAY_REQUEST_TIMEOUT_SECS: 10
+      WATTETHERIA_GATEWAY_REGISTRY_ADMIN_TOKEN: change-me
+      WATTETHERIA_GATEWAY_BOOTSTRAP_REGISTRY_URLS:
+      WATTETHERIA_GATEWAY_IDENTITY_ID: gw-docker-1
+      WATTETHERIA_GATEWAY_IDENTITY_DISPLAY_NAME: Docker Gateway
+      WATTETHERIA_GATEWAY_IDENTITY_BASE_URL: http://127.0.0.1:8080
+      WATTETHERIA_GATEWAY_IDENTITY_REGION: local-dev
+      WATTETHERIA_GATEWAY_IDENTITY_OPERATOR_ID: operator-docker
+      WATTETHERIA_GATEWAY_IDENTITY_ROLES: ingest,query,federation
+      WATTETHERIA_GATEWAY_IDENTITY_SUPPORTED_ENDPOINTS: /api/network/status,/api/peers,/api/topics,/api/topic-messages,/api/tasks,/api/organizations,/api/leaderboard,/api/registry/gateways,/api/registry/bootstrap,/api/registry/discovery,/api/registry/self-manifest,/api/registry/self-register
+      WATTETHERIA_GATEWAY_IDENTITY_ALLOWS_PUBLIC_INGEST: "true"
+      WATTETHERIA_GATEWAY_IDENTITY_SIGNING_KEY: CwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCws=
+    depends_on:
+      - postgres
+      - nats
+    ports:
+      - "8080:8080"
+
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: wattetheria_gateway
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "55433:5432"
+    volumes:
+      - gateway-postgres-data:/var/lib/postgresql/data
+
+  nats:
+    image: nats:2.11-alpine
+    command: ["-js"]
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+
+volumes:
+  gateway-postgres-data:
