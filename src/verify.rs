@@ -3,6 +3,10 @@ use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 
+const DID_KEY_PREFIX: &str = "did:key:";
+const DID_KEY_BASE58BTC_PREFIX: &str = "z";
+const ED25519_MULTICODEC_PREFIX: [u8; 2] = [0xed, 0x01];
+
 pub fn canonical_bytes(payload: &impl serde::Serialize) -> Result<Vec<u8>> {
     let json = serde_jcs::to_string(payload).context("canonicalize payload")?;
     Ok(json.into_bytes())
@@ -10,25 +14,30 @@ pub fn canonical_bytes(payload: &impl serde::Serialize) -> Result<Vec<u8>> {
 
 pub fn verify_signed_snapshot(
     snapshot: &SignedPublicClientSnapshot,
-    expected_signer_agent_id: Option<&str>,
+    expected_signer_agent_did: Option<&str>,
 ) -> Result<()> {
     let payload = &snapshot.payload;
+    let signer_public_key_b64 = public_key_b64_from_ref(&snapshot.signer_agent_did)
+        .context("resolve signer_agent_did public key")?;
     if payload.node_id.trim().is_empty() {
         bail!("snapshot node_id is empty");
     }
     if payload.public_key.trim().is_empty() {
         bail!("snapshot public_key is empty");
     }
-    if let Some(expected) = expected_signer_agent_id
-        && snapshot.signer_agent_id != expected
-    {
-        bail!(
-            "unexpected signer_agent_id: expected {expected}, got {}",
-            snapshot.signer_agent_id
-        );
+    if let Some(expected) = expected_signer_agent_did {
+        let expected_public_key_b64 = public_key_b64_from_ref(expected)
+            .context("resolve expected_signer_agent_did public key")?;
+        if snapshot.signer_agent_did != expected && signer_public_key_b64 != expected_public_key_b64
+        {
+            bail!(
+                "unexpected signer_agent_did: expected {expected}, got {}",
+                snapshot.signer_agent_did
+            );
+        }
     }
-    if snapshot.signer_agent_id != payload.public_key {
-        bail!("signer_agent_id does not match payload public_key");
+    if signer_public_key_b64 != payload.public_key {
+        bail!("signer_agent_did does not resolve to payload public_key");
     }
     verify_canonical_signature(
         payload,
@@ -96,6 +105,29 @@ pub fn verify_canonical_signature(
     Ok(())
 }
 
+fn public_key_b64_from_ref(public_key_ref: &str) -> Result<String> {
+    if public_key_ref.starts_with(DID_KEY_PREFIX) {
+        return public_key_b64_from_did_key(public_key_ref);
+    }
+    Ok(public_key_ref.to_string())
+}
+
+fn public_key_b64_from_did_key(agent_did: &str) -> Result<String> {
+    let encoded = agent_did
+        .strip_prefix(DID_KEY_PREFIX)
+        .ok_or_else(|| anyhow::anyhow!("unsupported DID method"))?;
+    let encoded = encoded
+        .strip_prefix(DID_KEY_BASE58BTC_PREFIX)
+        .ok_or_else(|| anyhow::anyhow!("did:key must use base58btc multibase"))?;
+    let decoded = bs58::decode(encoded)
+        .into_vec()
+        .context("decode did:key multibase")?;
+    if decoded.len() != 34 || decoded[..2] != ED25519_MULTICODEC_PREFIX {
+        bail!("did:key is not an Ed25519 verification key");
+    }
+    Ok(STANDARD.encode(&decoded[2..]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,9 +163,10 @@ mod tests {
         let snapshot = SignedPublicClientSnapshot {
             payload,
             signature,
-            signer_agent_id: public_key.clone(),
+            signer_agent_did: did_key_from_public_key_b64(&public_key),
         };
 
+        verify_signed_snapshot(&snapshot, Some(&snapshot.signer_agent_did)).unwrap();
         verify_signed_snapshot(&snapshot, Some(&public_key)).unwrap();
     }
 
@@ -148,7 +181,7 @@ mod tests {
             base_url: "https://gw-ap.example".to_string(),
             public_key: public_key.clone(),
             region: Some("ap-southeast".to_string()),
-            operator_id: Some("operator-ap".to_string()),
+            operator_did: Some("did:key:operator-ap".to_string()),
             roles: vec!["ingest".to_string(), "query".to_string()],
             supported_endpoints: vec!["/api/network/status".to_string()],
             federation_peers: vec!["https://gw-us.example".to_string()],
@@ -162,5 +195,16 @@ mod tests {
         let manifest = SignedGatewayManifest { payload, signature };
 
         verify_signed_gateway_manifest(&manifest).unwrap();
+    }
+
+    fn did_key_from_public_key_b64(public_key_b64: &str) -> String {
+        let public_key = STANDARD.decode(public_key_b64).unwrap();
+        let mut multicodec = Vec::with_capacity(ED25519_MULTICODEC_PREFIX.len() + public_key.len());
+        multicodec.extend_from_slice(&ED25519_MULTICODEC_PREFIX);
+        multicodec.extend_from_slice(&public_key);
+        format!(
+            "{DID_KEY_PREFIX}{DID_KEY_BASE58BTC_PREFIX}{}",
+            bs58::encode(multicodec).into_string()
+        )
     }
 }

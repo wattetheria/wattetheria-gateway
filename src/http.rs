@@ -85,7 +85,7 @@ async fn register_node(
         body.name.trim(),
         body.export_url.trim(),
         body.region.as_deref(),
-        body.expected_signer_agent_id.as_deref(),
+        body.expected_signer_agent_did.as_deref(),
     )
     .await
     {
@@ -517,7 +517,7 @@ async fn sync_nodes(State(state): State<AppState>, Json(body): Json<SyncRequest>
             }
         };
         if let Err(error) =
-            verify_signed_snapshot(&fetched, source.expected_signer_agent_id.as_deref())
+            verify_signed_snapshot(&fetched, source.expected_signer_agent_did.as_deref())
         {
             let message = error.to_string();
             let _ =
@@ -543,7 +543,7 @@ async fn sync_nodes(State(state): State<AppState>, Json(body): Json<SyncRequest>
         results.push(SyncResult {
             source_id: Some(source.id),
             node_id: fetched.payload.node_id,
-            signer_agent_id: fetched.signer_agent_id,
+            signer_agent_did: fetched.signer_agent_did,
             generated_at: fetched.payload.generated_at,
         });
     }
@@ -623,7 +623,7 @@ async fn ingest_snapshot(
         Ok(()) => Json(json!({
             "status": "ok",
             "node_id": snapshot.payload.node_id,
-            "signer_agent_id": snapshot.signer_agent_id,
+            "signer_agent_did": snapshot.signer_agent_did,
             "generated_at": snapshot.payload.generated_at,
         }))
         .into_response(),
@@ -659,13 +659,13 @@ async fn list_nodes(State(state): State<AppState>) -> Response {
                         "name": source.name,
                         "export_url": source.export_url,
                         "region": source.region,
-                        "expected_signer_agent_id": source.expected_signer_agent_id,
+                        "expected_signer_agent_did": source.expected_signer_agent_did,
                         "last_sync_at": source.last_sync_at,
                         "last_sync_status": source.last_sync_status,
                         "last_error": source.last_error,
                         "snapshot": snapshot.map(|row| json!({
                             "node_id": row.node_id,
-                            "signer_agent_id": row.signer_agent_id,
+                            "signer_agent_did": row.signer_agent_did,
                             "generated_at": row.generated_at,
                             "ingested_at": row.ingested_at,
                         })),
@@ -681,13 +681,13 @@ async fn list_nodes(State(state): State<AppState>) -> Response {
                                 "name": row.node_id,
                                 "export_url": Value::Null,
                                 "region": Value::Null,
-                                "expected_signer_agent_id": Value::Null,
+                                "expected_signer_agent_did": Value::Null,
                                 "last_sync_at": row.ingested_at,
                                 "last_sync_status": "push",
                                 "last_error": Value::Null,
                                 "snapshot": {
                                     "node_id": row.node_id,
-                                    "signer_agent_id": row.signer_agent_id,
+                                    "signer_agent_did": row.signer_agent_did,
                                     "generated_at": row.generated_at,
                                     "ingested_at": row.ingested_at,
                                 },
@@ -709,16 +709,16 @@ async fn ingest_signed_snapshot(
     state: &AppState,
     snapshot: &SignedPublicClientSnapshot,
     source_id: Option<Uuid>,
-    expected_signer_agent_id: Option<&str>,
+    expected_signer_agent_did: Option<&str>,
 ) -> anyhow::Result<()> {
-    verify_signed_snapshot(snapshot, expected_signer_agent_id)?;
+    verify_signed_snapshot(snapshot, expected_signer_agent_did)?;
     let payload_json = serde_json::to_value(&snapshot.payload)?;
     db::upsert_snapshot(
         &state.pool,
         db::UpsertSnapshotRecord {
             source_id,
             node_id: &snapshot.payload.node_id,
-            signer_agent_id: &snapshot.signer_agent_id,
+            signer_agent_did: &snapshot.signer_agent_did,
             public_key: &snapshot.payload.public_key,
             generated_at: snapshot.payload.generated_at,
             payload: &payload_json,
@@ -730,7 +730,7 @@ async fn ingest_signed_snapshot(
         "event": "gateway.snapshot.ingested",
         "source_id": source_id,
         "node_id": snapshot.payload.node_id,
-        "signer_agent_id": snapshot.signer_agent_id,
+        "signer_agent_did": snapshot.signer_agent_did,
         "generated_at": snapshot.payload.generated_at,
         "timestamp": db::now_rfc3339(),
     });

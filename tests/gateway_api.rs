@@ -47,7 +47,7 @@ async fn register_and_sync_ingests_snapshot_and_aggregates() {
             })],
             tasks: &[json!({"id":"task-1","title":"Relay Repair"})],
             organizations: &[json!({"id":"org-1","name":"Aurora Guild"})],
-            leaderboard: &[json!({"agent_id":"agent-1","score":9})],
+            leaderboard: &[json!({"agent_did":"did:key:agent-1","score":9})],
         },
     ))
     .await;
@@ -202,7 +202,7 @@ async fn upsert_snapshot_replaces_existing_snapshot_for_same_source() {
         UpsertSnapshotRecord {
             source_id: Some(source_id),
             node_id: "node-a",
-            signer_agent_id: "pub-a",
+            signer_agent_did: "pub-a",
             public_key: "pub-a",
             generated_at: 1,
             payload: &first,
@@ -229,7 +229,7 @@ async fn upsert_snapshot_replaces_existing_snapshot_for_same_source() {
         UpsertSnapshotRecord {
             source_id: Some(source_id),
             node_id: "node-a",
-            signer_agent_id: "pub-a",
+            signer_agent_did: "pub-a",
             public_key: "pub-a",
             generated_at: 2,
             payload: &second,
@@ -265,7 +265,7 @@ async fn ingest_snapshot_accepts_push_without_registered_source() {
             ],
             tasks: &[json!({"id":"task-9"})],
             organizations: &[json!({"id":"org-9"})],
-            leaderboard: &[json!({"agent_id":"agent-9","score":99})],
+            leaderboard: &[json!({"agent_did":"did:key:agent-9","score":99})],
         },
     );
 
@@ -653,7 +653,7 @@ async fn bootstrap_registry_list_and_discovery_aggregate_upstreams() {
                     "base_url": "https://gw-remote.example",
                     "public_key": "remote-pub",
                     "region": "eu-west",
-                    "operator_id": "operator-remote",
+                    "operator_did": "did:key:operator-remote",
                     "roles": ["query", "federation"],
                     "supported_endpoints": ["/api/network/status"],
                     "federation_peers": [],
@@ -665,7 +665,7 @@ async fn bootstrap_registry_list_and_discovery_aggregate_upstreams() {
                         "base_url": "https://gw-remote.example",
                         "public_key": "remote-pub",
                         "region": "eu-west",
-                        "operator_id": "operator-remote",
+                        "operator_did": "did:key:operator-remote",
                         "roles": ["query", "federation"],
                         "supported_endpoints": ["/api/network/status"],
                         "federation_peers": [],
@@ -754,7 +754,7 @@ async fn test_app_with_identity(database_url: &str) -> Router {
         display_name: Some("Self Gateway".to_string()),
         base_url: Some("https://gateway.self.example".to_string()),
         region: Some("ap-southeast".to_string()),
-        operator_id: Some("operator-self".to_string()),
+        operator_did: Some("did:key:operator-self".to_string()),
         roles: vec!["ingest".to_string(), "query".to_string()],
         supported_endpoints: vec!["/api/network/status".to_string()],
         federation_peers: vec!["https://gw-us.example".to_string()],
@@ -784,7 +784,7 @@ async fn test_app_with_identity_and_bootstrap(
         display_name: Some("Self Gateway".to_string()),
         base_url: Some("https://gateway.self.example".to_string()),
         region: Some("ap-southeast".to_string()),
-        operator_id: Some("operator-self".to_string()),
+        operator_did: Some("did:key:operator-self".to_string()),
         roles: vec!["ingest".to_string(), "query".to_string()],
         supported_endpoints: vec!["/api/network/status".to_string()],
         federation_peers: vec!["https://gw-us.example".to_string()],
@@ -1045,7 +1045,7 @@ fn signed_snapshot_at(
     SignedPublicClientSnapshot {
         payload,
         signature,
-        signer_agent_id: public_key,
+        signer_agent_did: did_key_from_public_key_b64(&public_key),
     }
 }
 
@@ -1064,7 +1064,7 @@ fn signed_gateway_manifest(
         base_url: base_url.to_string(),
         public_key,
         region: Some(region.to_string()),
-        operator_id: Some("operator-root".to_string()),
+        operator_did: Some("did:key:operator-root".to_string()),
         roles: vec![
             "ingest".to_string(),
             "query".to_string(),
@@ -1083,4 +1083,21 @@ fn signed_gateway_manifest(
             .to_bytes(),
     );
     SignedGatewayManifest { payload, signature }
+}
+
+fn did_key_from_public_key_b64(public_key_b64: &str) -> String {
+    const DID_KEY_PREFIX: &str = "did:key:";
+    const DID_KEY_BASE58BTC_PREFIX: &str = "z";
+    const ED25519_MULTICODEC_PREFIX: [u8; 2] = [0xed, 0x01];
+
+    let public_key = base64::engine::general_purpose::STANDARD
+        .decode(public_key_b64)
+        .unwrap();
+    let mut multicodec = Vec::with_capacity(ED25519_MULTICODEC_PREFIX.len() + public_key.len());
+    multicodec.extend_from_slice(&ED25519_MULTICODEC_PREFIX);
+    multicodec.extend_from_slice(&public_key);
+    format!(
+        "{DID_KEY_PREFIX}{DID_KEY_BASE58BTC_PREFIX}{}",
+        bs58::encode(multicodec).into_string()
+    )
 }

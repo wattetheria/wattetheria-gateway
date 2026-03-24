@@ -10,7 +10,7 @@ pub struct GatewayIdentity {
     display_name: String,
     base_url: String,
     region: Option<String>,
-    operator_id: Option<String>,
+    operator_did: Option<String>,
     roles: Vec<String>,
     supported_endpoints: Vec<String>,
     federation_peers: Vec<String>,
@@ -24,7 +24,7 @@ pub struct GatewayIdentityConfig {
     pub display_name: Option<String>,
     pub base_url: Option<String>,
     pub region: Option<String>,
-    pub operator_id: Option<String>,
+    pub operator_did: Option<String>,
     pub roles: Vec<String>,
     pub supported_endpoints: Vec<String>,
     pub federation_peers: Vec<String>,
@@ -39,7 +39,7 @@ impl GatewayIdentity {
             || config.base_url.is_some()
             || config.signing_key_b64.is_some()
             || config.region.is_some()
-            || config.operator_id.is_some();
+            || config.operator_did.is_some();
         if !any_present {
             return Ok(None);
         }
@@ -90,7 +90,7 @@ impl GatewayIdentity {
             display_name,
             base_url: base_url.trim_end_matches('/').to_string(),
             region: config.region,
-            operator_id: config.operator_id,
+            operator_did: config.operator_did,
             roles,
             supported_endpoints,
             federation_peers: config.federation_peers,
@@ -107,7 +107,7 @@ impl GatewayIdentity {
             base_url: self.base_url.clone(),
             public_key: STANDARD.encode(self.signing_key.verifying_key().as_bytes()),
             region: self.region.clone(),
-            operator_id: self.operator_id.clone(),
+            operator_did: self.operator_did.clone(),
             roles: self.roles.clone(),
             supported_endpoints: self.supported_endpoints.clone(),
             federation_peers: self.federation_peers.clone(),
@@ -159,7 +159,7 @@ mod tests {
             display_name: Some("AP Gateway".to_string()),
             base_url: Some("https://gw-ap.example".to_string()),
             region: Some("ap-southeast".to_string()),
-            operator_id: Some("operator-ap".to_string()),
+            operator_did: Some("did:key:operator-ap".to_string()),
             roles: Vec::new(),
             supported_endpoints: Vec::new(),
             federation_peers: vec!["https://gw-us.example".to_string()],
@@ -186,7 +186,7 @@ mod tests {
             display_name: None,
             base_url: None,
             region: None,
-            operator_id: None,
+            operator_did: None,
             roles: Vec::new(),
             supported_endpoints: Vec::new(),
             federation_peers: Vec::new(),
@@ -204,7 +204,7 @@ mod tests {
             display_name: None,
             base_url: Some("https://gw-ap.example".to_string()),
             region: None,
-            operator_id: None,
+            operator_did: None,
             roles: Vec::new(),
             supported_endpoints: Vec::new(),
             federation_peers: Vec::new(),

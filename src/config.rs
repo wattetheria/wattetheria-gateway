@@ -35,7 +35,9 @@ impl Config {
             display_name: env::var("WATTETHERIA_GATEWAY_IDENTITY_DISPLAY_NAME").ok(),
             base_url: env::var("WATTETHERIA_GATEWAY_IDENTITY_BASE_URL").ok(),
             region: env::var("WATTETHERIA_GATEWAY_IDENTITY_REGION").ok(),
-            operator_id: env::var("WATTETHERIA_GATEWAY_IDENTITY_OPERATOR_ID").ok(),
+            operator_did: env::var("WATTETHERIA_GATEWAY_IDENTITY_OPERATOR_DID")
+                .ok()
+                .or_else(|| env::var("WATTETHERIA_GATEWAY_IDENTITY_OPERATOR_ID").ok()),
             roles: parse_csv_env("WATTETHERIA_GATEWAY_IDENTITY_ROLES"),
             supported_endpoints: parse_csv_env("WATTETHERIA_GATEWAY_IDENTITY_SUPPORTED_ENDPOINTS"),
             federation_peers: parse_csv_env("WATTETHERIA_GATEWAY_IDENTITY_FEDERATION_PEERS"),

@@ -172,6 +172,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bs58"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf88ba1141d185c399bee5288d850d63b8369520c1eafc32a0430b5b6c287bf4"
+dependencies = [
+ "tinyvec",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2769,6 +2778,7 @@ dependencies = [
  "async-nats",
  "axum",
  "base64",
+ "bs58",
  "chrono",
  "ed25519-dalek",
  "rand 0.8.5",

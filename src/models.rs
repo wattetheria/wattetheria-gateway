@@ -7,7 +7,8 @@ use uuid::Uuid;
 pub struct SignedPublicClientSnapshot {
     pub payload: PublicClientSnapshot,
     pub signature: String,
-    pub signer_agent_id: String,
+    #[serde(alias = "signer_agent_id")]
+    pub signer_agent_did: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -36,7 +37,8 @@ pub struct GatewayManifest {
     pub base_url: String,
     pub public_key: String,
     pub region: Option<String>,
-    pub operator_id: Option<String>,
+    #[serde(alias = "operator_id")]
+    pub operator_did: Option<String>,
     pub roles: Vec<String>,
     pub supported_endpoints: Vec<String>,
     pub federation_peers: Vec<String>,
@@ -55,7 +57,7 @@ pub struct NodeSourceRow {
     pub name: String,
     pub export_url: String,
     pub region: Option<String>,
-    pub expected_signer_agent_id: Option<String>,
+    pub expected_signer_agent_did: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
     pub last_sync_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -67,7 +69,7 @@ pub struct NodeSourceRow {
 pub struct SnapshotRow {
     pub source_id: Option<Uuid>,
     pub node_id: String,
-    pub signer_agent_id: String,
+    pub signer_agent_did: String,
     pub public_key: String,
     pub generated_at: i64,
     pub ingested_at: chrono::DateTime<chrono::Utc>,
@@ -82,7 +84,7 @@ pub struct GatewayRegistryDbRow {
     pub base_url: String,
     pub public_key: String,
     pub region: Option<String>,
-    pub operator_id: Option<String>,
+    pub operator_did: Option<String>,
     pub roles: sqlx::types::Json<Vec<String>>,
     pub supported_endpoints: sqlx::types::Json<Vec<String>>,
     pub federation_peers: sqlx::types::Json<Vec<String>>,
@@ -105,7 +107,7 @@ pub struct GatewayRegistryEntry {
     pub base_url: String,
     pub public_key: String,
     pub region: Option<String>,
-    pub operator_id: Option<String>,
+    pub operator_did: Option<String>,
     pub roles: Vec<String>,
     pub supported_endpoints: Vec<String>,
     pub federation_peers: Vec<String>,
@@ -129,7 +131,7 @@ impl From<GatewayRegistryDbRow> for GatewayRegistryEntry {
             base_url: value.base_url,
             public_key: value.public_key,
             region: value.region,
-            operator_id: value.operator_id,
+            operator_did: value.operator_did,
             roles: value.roles.0,
             supported_endpoints: value.supported_endpoints.0,
             federation_peers: value.federation_peers.0,
@@ -152,7 +154,8 @@ pub struct RegisterNodeRequest {
     pub name: String,
     pub export_url: String,
     pub region: Option<String>,
-    pub expected_signer_agent_id: Option<String>,
+    #[serde(alias = "expected_signer_agent_id")]
+    pub expected_signer_agent_did: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -171,7 +174,7 @@ pub struct SyncRequest {
 pub struct SyncResult {
     pub source_id: Option<Uuid>,
     pub node_id: String,
-    pub signer_agent_id: String,
+    pub signer_agent_did: String,
     pub generated_at: i64,
 }
 

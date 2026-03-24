@@ -11,7 +11,7 @@ use uuid::Uuid;
 pub struct UpsertSnapshotRecord<'a> {
     pub source_id: Option<Uuid>,
     pub node_id: &'a str,
-    pub signer_agent_id: &'a str,
+    pub signer_agent_did: &'a str,
     pub public_key: &'a str,
     pub generated_at: i64,
     pub payload: &'a Value,
@@ -37,7 +37,7 @@ pub async fn init_schema(pool: &PgPool) -> Result<()> {
             name text not null,
             export_url text not null unique,
             region text null,
-            expected_signer_agent_id text null,
+            expected_signer_agent_did text null,
             created_at timestamptz not null default now(),
             updated_at timestamptz not null default now(),
             last_sync_at timestamptz null,
@@ -54,7 +54,7 @@ pub async fn init_schema(pool: &PgPool) -> Result<()> {
         create table if not exists node_snapshots (
             node_id text primary key,
             source_id uuid null references node_sources(id) on delete set null,
-            signer_agent_id text not null,
+            signer_agent_did text not null,
             public_key text not null,
             generated_at bigint not null,
             ingested_at timestamptz not null default now(),
@@ -82,7 +82,7 @@ pub async fn init_schema(pool: &PgPool) -> Result<()> {
             base_url text not null unique,
             public_key text not null,
             region text null,
-            operator_id text null,
+            operator_did text null,
             roles jsonb not null default '[]'::jsonb,
             supported_endpoints jsonb not null default '[]'::jsonb,
             federation_peers jsonb not null default '[]'::jsonb,
@@ -97,6 +97,75 @@ pub async fn init_schema(pool: &PgPool) -> Result<()> {
             created_at timestamptz not null default now(),
             updated_at timestamptz not null default now()
         );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        do $$
+        begin
+            if exists (
+                select 1
+                from information_schema.columns
+                where table_name = 'node_sources' and column_name = 'expected_signer_agent_id'
+            ) and not exists (
+                select 1
+                from information_schema.columns
+                where table_name = 'node_sources' and column_name = 'expected_signer_agent_did'
+            ) then
+                alter table node_sources
+                rename column expected_signer_agent_id to expected_signer_agent_did;
+            end if;
+        end
+        $$;
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        do $$
+        begin
+            if exists (
+                select 1
+                from information_schema.columns
+                where table_name = 'node_snapshots' and column_name = 'signer_agent_id'
+            ) and not exists (
+                select 1
+                from information_schema.columns
+                where table_name = 'node_snapshots' and column_name = 'signer_agent_did'
+            ) then
+                alter table node_snapshots
+                rename column signer_agent_id to signer_agent_did;
+            end if;
+        end
+        $$;
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        do $$
+        begin
+            if exists (
+                select 1
+                from information_schema.columns
+                where table_name = 'gateway_registry_entries' and column_name = 'operator_id'
+            ) and not exists (
+                select 1
+                from information_schema.columns
+                where table_name = 'gateway_registry_entries' and column_name = 'operator_did'
+            ) then
+                alter table gateway_registry_entries
+                rename column operator_id to operator_did;
+            end if;
+        end
+        $$;
         "#,
     )
     .execute(pool)
@@ -127,12 +196,12 @@ pub async fn insert_node_source(
     name: &str,
     export_url: &str,
     region: Option<&str>,
-    expected_signer_agent_id: Option<&str>,
+    expected_signer_agent_did: Option<&str>,
 ) -> Result<()> {
     sqlx::query(
         r#"
         insert into node_sources (
-            id, name, export_url, region, expected_signer_agent_id, created_at, updated_at
+            id, name, export_url, region, expected_signer_agent_did, created_at, updated_at
         )
         values ($1, $2, $3, $4, $5, now(), now())
         "#,
@@ -141,7 +210,7 @@ pub async fn insert_node_source(
     .bind(name)
     .bind(export_url)
     .bind(region)
-    .bind(expected_signer_agent_id)
+    .bind(expected_signer_agent_did)
     .execute(pool)
     .await?;
     Ok(())
@@ -155,7 +224,7 @@ pub async fn list_node_sources(pool: &PgPool) -> Result<Vec<NodeSourceRow>> {
             name,
             export_url,
             region,
-            expected_signer_agent_id,
+            expected_signer_agent_did,
             created_at,
             updated_at,
             last_sync_at,
@@ -177,7 +246,7 @@ pub async fn get_node_source(pool: &PgPool, source_id: Uuid) -> Result<Option<No
             name,
             export_url,
             region,
-            expected_signer_agent_id,
+            expected_signer_agent_did,
             created_at,
             updated_at,
             last_sync_at,
@@ -221,13 +290,13 @@ pub async fn upsert_snapshot(pool: &PgPool, record: UpsertSnapshotRecord<'_>) ->
     sqlx::query(
         r#"
         insert into node_snapshots (
-            node_id, source_id, signer_agent_id, public_key, generated_at, ingested_at, payload, signature
+            node_id, source_id, signer_agent_did, public_key, generated_at, ingested_at, payload, signature
         )
         values ($1, $2, $3, $4, $5, now(), $6, $7)
         on conflict (node_id) do update
         set
             source_id = coalesce(excluded.source_id, node_snapshots.source_id),
-            signer_agent_id = excluded.signer_agent_id,
+            signer_agent_did = excluded.signer_agent_did,
             public_key = excluded.public_key,
             generated_at = excluded.generated_at,
             ingested_at = now(),
@@ -238,7 +307,7 @@ pub async fn upsert_snapshot(pool: &PgPool, record: UpsertSnapshotRecord<'_>) ->
     )
     .bind(record.node_id)
     .bind(record.source_id)
-    .bind(record.signer_agent_id)
+    .bind(record.signer_agent_did)
     .bind(record.public_key)
     .bind(record.generated_at)
     .bind(sqlx::types::Json(record.payload))
@@ -254,7 +323,7 @@ pub async fn list_snapshots(pool: &PgPool) -> Result<Vec<SnapshotRow>> {
         select
             source_id,
             node_id,
-            signer_agent_id,
+            signer_agent_did,
             public_key,
             generated_at,
             ingested_at,
@@ -294,7 +363,7 @@ pub async fn upsert_gateway_manifest(
             base_url,
             public_key,
             region,
-            operator_id,
+            operator_did,
             roles,
             supported_endpoints,
             federation_peers,
@@ -315,7 +384,7 @@ pub async fn upsert_gateway_manifest(
             base_url = excluded.base_url,
             public_key = excluded.public_key,
             region = excluded.region,
-            operator_id = excluded.operator_id,
+            operator_did = excluded.operator_did,
             roles = excluded.roles,
             supported_endpoints = excluded.supported_endpoints,
             federation_peers = excluded.federation_peers,
@@ -330,7 +399,7 @@ pub async fn upsert_gateway_manifest(
     .bind(&payload.base_url)
     .bind(&payload.public_key)
     .bind(payload.region.as_deref())
-    .bind(payload.operator_id.as_deref())
+    .bind(payload.operator_did.as_deref())
     .bind(sqlx::types::Json(&payload.roles))
     .bind(sqlx::types::Json(&payload.supported_endpoints))
     .bind(sqlx::types::Json(&payload.federation_peers))
@@ -391,7 +460,7 @@ pub async fn list_gateway_registry_entries(
             base_url,
             public_key,
             region,
-            operator_id,
+            operator_did,
             roles,
             supported_endpoints,
             federation_peers,
@@ -443,7 +512,7 @@ pub async fn get_gateway_registry_entry(
             base_url,
             public_key,
             region,
-            operator_id,
+            operator_did,
             roles,
             supported_endpoints,
             federation_peers,
