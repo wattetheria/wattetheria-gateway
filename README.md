@@ -18,8 +18,6 @@ It now also includes the first `Gateway Registry` slice:
 - only `approved` gateways appear in the public discovery list
 - registry operators can review and tier gateways for discovery
 
-The registry design note lives in [docs/GATEWAY_REGISTRY.md](docs/GATEWAY_REGISTRY.md).
-
 ## Initial Stack
 
 The initial MVP stack is:
@@ -124,7 +122,7 @@ Environment variables:
 - `WATTETHERIA_GATEWAY_IDENTITY_BASE_URL`
 - `WATTETHERIA_GATEWAY_IDENTITY_SIGNING_KEY`
 - `WATTETHERIA_GATEWAY_IDENTITY_REGION`
-- `WATTETHERIA_GATEWAY_IDENTITY_OPERATOR_ID`
+- `WATTETHERIA_GATEWAY_IDENTITY_OPERATOR_DID`
 - `WATTETHERIA_GATEWAY_IDENTITY_ROLES`
 - `WATTETHERIA_GATEWAY_IDENTITY_SUPPORTED_ENDPOINTS`
 - `WATTETHERIA_GATEWAY_IDENTITY_FEDERATION_PEERS`

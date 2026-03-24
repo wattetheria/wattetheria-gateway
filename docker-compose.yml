@@ -32,7 +32,7 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
     ports:
-      - "55433:5432"
+      - "55434:5432"
     volumes:
       - gateway-postgres-data:/var/lib/postgresql/data
 
