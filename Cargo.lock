@@ -1563,7 +1563,9 @@ checksum = "eddd3ca559203180a307f12d114c268abf583f59b03cb906fd0b3ff8646c1147"
 dependencies = [
  "base64",
  "bytes",
+ "futures-channel",
  "futures-core",
+ "futures-util",
  "http",
  "http-body",
  "http-body-util",
@@ -2771,6 +2773,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "watt-did"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "bs58",
+ "ed25519-dalek",
+ "percent-encoding",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "wattetheria-gateway"
 version = "0.1.0"
 dependencies = [
@@ -2792,6 +2808,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "watt-did",
 ]
 
 [[package]]

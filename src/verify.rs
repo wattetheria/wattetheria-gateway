@@ -2,10 +2,7 @@ use crate::models::{SignedGatewayManifest, SignedPublicClientSnapshot};
 use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-
-const DID_KEY_PREFIX: &str = "did:key:";
-const DID_KEY_BASE58BTC_PREFIX: &str = "z";
-const ED25519_MULTICODEC_PREFIX: [u8; 2] = [0xed, 0x01];
+use watt_did::{Did, DidKey, DidKeyPublicKey};
 
 pub fn canonical_bytes(payload: &impl serde::Serialize) -> Result<Vec<u8>> {
     let json = serde_jcs::to_string(payload).context("canonicalize payload")?;
@@ -106,26 +103,23 @@ pub fn verify_canonical_signature(
 }
 
 fn public_key_b64_from_ref(public_key_ref: &str) -> Result<String> {
-    if public_key_ref.starts_with(DID_KEY_PREFIX) {
+    if public_key_ref.starts_with("did:") {
         return public_key_b64_from_did_key(public_key_ref);
     }
     Ok(public_key_ref.to_string())
 }
 
 fn public_key_b64_from_did_key(agent_did: &str) -> Result<String> {
-    let encoded = agent_did
-        .strip_prefix(DID_KEY_PREFIX)
-        .ok_or_else(|| anyhow::anyhow!("unsupported DID method"))?;
-    let encoded = encoded
-        .strip_prefix(DID_KEY_BASE58BTC_PREFIX)
-        .ok_or_else(|| anyhow::anyhow!("did:key must use base58btc multibase"))?;
-    let decoded = bs58::decode(encoded)
-        .into_vec()
-        .context("decode did:key multibase")?;
-    if decoded.len() != 34 || decoded[..2] != ED25519_MULTICODEC_PREFIX {
-        bail!("did:key is not an Ed25519 verification key");
-    }
-    Ok(STANDARD.encode(&decoded[2..]))
+    let did = Did::parse(agent_did).context("parse did:key")?;
+    let did_key = DidKey::from_did(did).context("build did:key helper")?;
+    let public_key = match did_key
+        .decode_public_key()
+        .context("decode did:key public key")?
+    {
+        DidKeyPublicKey::Ed25519(bytes) => bytes,
+        _ => bail!("did:key is not an Ed25519 verification key"),
+    };
+    Ok(STANDARD.encode(public_key))
 }
 
 #[cfg(test)]
@@ -135,6 +129,9 @@ mod tests {
     use base64::engine::general_purpose::STANDARD;
     use ed25519_dalek::{Signer, SigningKey};
     use serde_json::json;
+    const DID_KEY_PREFIX: &str = "did:key:";
+    const DID_KEY_BASE58BTC_PREFIX: &str = "z";
+    const ED25519_MULTICODEC_PREFIX: [u8; 2] = [0xed, 0x01];
 
     #[test]
     fn signed_snapshot_verifies() {
