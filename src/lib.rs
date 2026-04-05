@@ -1,6 +1,7 @@
 pub mod config;
 pub mod db;
 pub mod gateway_identity;
+pub mod gateway_network;
 pub mod http;
 pub mod models;
 pub mod node_client;

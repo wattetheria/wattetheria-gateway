@@ -22,6 +22,16 @@ pub struct UpsertGatewayManifestRecord<'a> {
     pub manifest: &'a SignedGatewayManifest,
 }
 
+pub struct InsertNodeSourceRecord<'a> {
+    pub id: Uuid,
+    pub name: &'a str,
+    pub export_url: &'a str,
+    pub region: Option<&'a str>,
+    pub expected_signer_agent_did: Option<&'a str>,
+    pub transport_capabilities: Option<&'a Value>,
+    pub transport_contact_material: Option<&'a Value>,
+}
+
 pub async fn connect(database_url: &str) -> Result<PgPool> {
     Ok(PgPoolOptions::new()
         .max_connections(10)
@@ -42,8 +52,28 @@ pub async fn init_schema(pool: &PgPool) -> Result<()> {
             updated_at timestamptz not null default now(),
             last_sync_at timestamptz null,
             last_sync_status text null,
-            last_error text null
+            last_error text null,
+            transport_capabilities jsonb null,
+            transport_contact_material jsonb null
         );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        alter table node_sources
+            add column if not exists transport_capabilities jsonb null;
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        alter table node_sources
+            add column if not exists transport_contact_material jsonb null;
         "#,
     )
     .execute(pool)
@@ -190,27 +220,23 @@ pub async fn init_schema(pool: &PgPool) -> Result<()> {
     Ok(())
 }
 
-pub async fn insert_node_source(
-    pool: &PgPool,
-    id: Uuid,
-    name: &str,
-    export_url: &str,
-    region: Option<&str>,
-    expected_signer_agent_did: Option<&str>,
-) -> Result<()> {
+pub async fn insert_node_source(pool: &PgPool, record: InsertNodeSourceRecord<'_>) -> Result<()> {
     sqlx::query(
         r#"
         insert into node_sources (
-            id, name, export_url, region, expected_signer_agent_did, created_at, updated_at
+            id, name, export_url, region, expected_signer_agent_did, transport_capabilities,
+            transport_contact_material, created_at, updated_at
         )
-        values ($1, $2, $3, $4, $5, now(), now())
+        values ($1, $2, $3, $4, $5, $6, $7, now(), now())
         "#,
     )
-    .bind(id)
-    .bind(name)
-    .bind(export_url)
-    .bind(region)
-    .bind(expected_signer_agent_did)
+    .bind(record.id)
+    .bind(record.name)
+    .bind(record.export_url)
+    .bind(record.region)
+    .bind(record.expected_signer_agent_did)
+    .bind(record.transport_capabilities)
+    .bind(record.transport_contact_material)
     .execute(pool)
     .await?;
     Ok(())
@@ -229,7 +255,9 @@ pub async fn list_node_sources(pool: &PgPool) -> Result<Vec<NodeSourceRow>> {
             updated_at,
             last_sync_at,
             last_sync_status,
-            last_error
+            last_error,
+            transport_capabilities,
+            transport_contact_material
         from node_sources
         order by created_at asc
         "#,
@@ -251,7 +279,9 @@ pub async fn get_node_source(pool: &PgPool, source_id: Uuid) -> Result<Option<No
             updated_at,
             last_sync_at,
             last_sync_status,
-            last_error
+            last_error,
+            transport_capabilities,
+            transport_contact_material
         from node_sources
         where id = $1
         "#,

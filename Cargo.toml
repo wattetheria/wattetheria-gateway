@@ -21,6 +21,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 uuid = { version = "1", features = ["serde", "v4"] }
 watt-did = { path = "../watt-did" }
+wattswarm-network-substrate = { path = "../wattswarm/crates/network-substrate" }
+wattswarm-network-transport-core = { path = "../wattswarm/crates/network-transport-core" }
+wattswarm-network-transport-iroh = { path = "../wattswarm/crates/network-transport-iroh" }
 
 [dev-dependencies]
 rand = "0.8"

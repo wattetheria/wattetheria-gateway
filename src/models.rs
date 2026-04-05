@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::FromRow;
 use uuid::Uuid;
+use wattswarm_network_transport_core::{PeerTransportCapabilities, TransportContactMaterial};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignedPublicClientSnapshot {
@@ -16,6 +17,10 @@ pub struct PublicClientSnapshot {
     pub generated_at: i64,
     pub node_id: String,
     pub public_key: String,
+    #[serde(default)]
+    pub network_name: Option<String>,
+    #[serde(default)]
+    pub network_org_name: Option<String>,
     pub network_status: Value,
     pub peers: Vec<Value>,
     pub operator: Value,
@@ -63,6 +68,8 @@ pub struct NodeSourceRow {
     pub last_sync_at: Option<chrono::DateTime<chrono::Utc>>,
     pub last_sync_status: Option<String>,
     pub last_error: Option<String>,
+    pub transport_capabilities: Option<sqlx::types::Json<PeerTransportCapabilities>>,
+    pub transport_contact_material: Option<sqlx::types::Json<TransportContactMaterial>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
@@ -156,6 +163,10 @@ pub struct RegisterNodeRequest {
     pub region: Option<String>,
     #[serde(alias = "expected_signer_agent_id")]
     pub expected_signer_agent_did: Option<String>,
+    #[serde(default)]
+    pub transport_capabilities: Option<PeerTransportCapabilities>,
+    #[serde(default)]
+    pub transport_contact_material: Option<TransportContactMaterial>,
 }
 
 #[derive(Debug, Clone, Serialize)]

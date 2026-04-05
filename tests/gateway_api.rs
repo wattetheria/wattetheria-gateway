@@ -13,6 +13,7 @@ use std::sync::OnceLock;
 use tower::util::ServiceExt;
 use wattetheria_gateway::db::{self, UpsertSnapshotRecord};
 use wattetheria_gateway::gateway_identity::{GatewayIdentity, GatewayIdentityConfig};
+use wattetheria_gateway::gateway_network::{GatewayNetworkNode, GatewayNetworkRuntime};
 use wattetheria_gateway::http;
 use wattetheria_gateway::models::{
     GatewayManifest, PublicClientSnapshot, SignedGatewayManifest, SignedPublicClientSnapshot,
@@ -21,6 +22,7 @@ use wattetheria_gateway::node_client::NodeClient;
 use wattetheria_gateway::registry_client::RegistryClient;
 use wattetheria_gateway::state::AppState;
 use wattetheria_gateway::verify::{canonical_bytes, verify_signed_gateway_manifest};
+use wattswarm_network_transport_core::PeerTransportCapabilities;
 
 static POSTGRES_READY: OnceLock<()> = OnceLock::new();
 
@@ -30,6 +32,8 @@ async fn register_and_sync_ingests_snapshot_and_aggregates() {
     let export_server = MockExportServer::spawn(signed_snapshot(
         "node-alpha",
         SnapshotContents {
+            network_name: Some("Watt Etheria"),
+            network_org_name: Some("Aether Prime"),
             peers: &[json!({"id":"peer-1"}), json!({"id":"peer-2"})],
             public_topics: &[json!({
                 "topic_id":"topic-public-1",
@@ -79,6 +83,14 @@ async fn register_and_sync_ingests_snapshot_and_aggregates() {
         nodes.1[0]["snapshot"]["node_id"].as_str(),
         Some("node-alpha")
     );
+    assert_eq!(
+        nodes.1[0]["snapshot"]["network_name"].as_str(),
+        Some("Watt Etheria")
+    );
+    assert_eq!(
+        nodes.1[0]["snapshot"]["network_org_name"].as_str(),
+        Some("Aether Prime")
+    );
 
     let network_status = request(&app, "GET", "/api/network/status").await;
     assert_eq!(network_status.0, StatusCode::OK);
@@ -88,6 +100,14 @@ async fn register_and_sync_ingests_snapshot_and_aggregates() {
     assert_eq!(network_status.1["organizations"].as_u64(), Some(1));
     assert_eq!(network_status.1["topics"].as_u64(), Some(1));
     assert_eq!(network_status.1["topic_messages"].as_u64(), Some(1));
+    assert_eq!(
+        network_status.1["network_name"].as_str(),
+        Some("Watt Etheria")
+    );
+    assert_eq!(
+        network_status.1["network_org_name"].as_str(),
+        Some("Aether Prime")
+    );
 
     let peers = request(&app, "GET", "/api/peers?limit=10").await;
     assert_eq!(peers.0, StatusCode::OK);
@@ -131,6 +151,8 @@ async fn sync_rejects_invalid_signature_and_marks_source_invalid() {
     let mut invalid = signed_snapshot(
         "node-invalid",
         SnapshotContents {
+            network_name: None,
+            network_org_name: None,
             peers: &[],
             public_topics: &[],
             public_topic_messages: &[],
@@ -176,11 +198,15 @@ async fn upsert_snapshot_replaces_existing_snapshot_for_same_source() {
     let source_id = uuid::Uuid::new_v4();
     db::insert_node_source(
         &pool,
-        source_id,
-        "source-a",
-        "http://127.0.0.1:7777/v1/client/export",
-        Some("test"),
-        None,
+        db::InsertNodeSourceRecord {
+            id: source_id,
+            name: "source-a",
+            export_url: "http://127.0.0.1:7777/v1/client/export",
+            region: Some("test"),
+            expected_signer_agent_did: None,
+            transport_capabilities: None,
+            transport_contact_material: None,
+        },
     )
     .await
     .unwrap();
@@ -189,6 +215,8 @@ async fn upsert_snapshot_replaces_existing_snapshot_for_same_source() {
         "generated_at": 1,
         "node_id": "node-a",
         "public_key": "pub-a",
+        "network_name": null,
+        "network_org_name": null,
         "network_status": {},
         "peers": [],
         "operator": {},
@@ -216,6 +244,8 @@ async fn upsert_snapshot_replaces_existing_snapshot_for_same_source() {
         "generated_at": 2,
         "node_id": "node-a",
         "public_key": "pub-a",
+        "network_name": null,
+        "network_org_name": null,
         "network_status": {},
         "peers": [],
         "operator": {},
@@ -258,6 +288,8 @@ async fn ingest_snapshot_accepts_push_without_registered_source() {
     let snapshot = signed_snapshot(
         "node-push",
         SnapshotContents {
+            network_name: None,
+            network_org_name: None,
             peers: &[json!({"id":"peer-9"})],
             public_topics: &[json!({"topic_id":"topic-9","title":"Public Topic 9"})],
             public_topic_messages: &[
@@ -301,6 +333,8 @@ async fn public_topics_and_messages_are_deduped_sorted_and_filterable() {
     let first = signed_snapshot(
         "node-alpha",
         SnapshotContents {
+            network_name: None,
+            network_org_name: None,
             peers: &[],
             public_topics: &[json!({
                 "topic_id":"topic-a",
@@ -324,6 +358,8 @@ async fn public_topics_and_messages_are_deduped_sorted_and_filterable() {
     let second = signed_snapshot(
         "node-beta",
         SnapshotContents {
+            network_name: None,
+            network_org_name: None,
             peers: &[],
             public_topics: &[
                 json!({
@@ -414,6 +450,8 @@ async fn older_snapshot_does_not_replace_newer_snapshot() {
         "node-stable",
         1_710_000_100,
         SnapshotContents {
+            network_name: None,
+            network_org_name: None,
             peers: &[],
             public_topics: &[],
             public_topic_messages: &[],
@@ -426,6 +464,8 @@ async fn older_snapshot_does_not_replace_newer_snapshot() {
         "node-stable",
         1_710_000_090,
         SnapshotContents {
+            network_name: None,
+            network_org_name: None,
             peers: &[],
             public_topics: &[],
             public_topic_messages: &[],
@@ -732,6 +772,72 @@ async fn bootstrap_registry_list_and_discovery_aggregate_upstreams() {
     db.cleanup().await;
 }
 
+#[tokio::test]
+async fn register_node_persists_transport_material_and_routes() {
+    let db = TestDatabase::new().await;
+    let app = test_app(&db.database_url).await;
+
+    let register = request_json(
+        &app,
+        "POST",
+        "/api/nodes/register",
+        json!({
+            "name": "alpha",
+            "export_url": "https://alpha.example/v1/client/export",
+            "transport_capabilities": PeerTransportCapabilities::iroh_direct_default(),
+            "transport_contact_material": {
+                "transport": "iroh_direct",
+                "peer_id": "12D3KooWQdummy",
+                "metadata": {
+                    "route": "iroh_direct",
+                    "generated_at": 1710000000u64,
+                    "endpoint_id": "dummy-endpoint",
+                    "alpn": "/wattswarm/iroh/1",
+                    "listen_addrs": ["/ip4/127.0.0.1/tcp/0"],
+                    "capabilities": PeerTransportCapabilities::iroh_direct_default()
+                },
+                "extra": {
+                    "endpoint_id": "dummy-endpoint",
+                    "alpn": "/wattswarm/iroh/1",
+                    "direct_addrs": ["/ip4/127.0.0.1/tcp/0"],
+                    "relay_urls": []
+                }
+            }
+        }),
+    )
+    .await;
+    assert_eq!(register.0, StatusCode::CREATED);
+
+    let nodes = request(&app, "GET", "/api/nodes").await;
+    assert_eq!(nodes.0, StatusCode::OK);
+    assert_eq!(
+        nodes.1[0]["transport_capabilities"]["supports_iroh_direct"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        nodes.1[0]["recommended_routes"]["backfill_chunk"].as_str(),
+        Some("iroh_direct")
+    );
+
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn network_status_includes_gateway_runtime_when_shared_p2p_is_enabled() {
+    let db = TestDatabase::new().await;
+    let app = test_app_with_network(&db.database_url).await;
+
+    let response = request(&app, "GET", "/api/network/status").await;
+    assert_eq!(response.0, StatusCode::OK);
+    assert_eq!(
+        response.1["gateway_runtime"]["transport_capabilities"]["supports_iroh_direct"].as_bool(),
+        Some(true)
+    );
+    assert!(response.1["gateway_runtime"]["peer_id"].as_str().is_some());
+
+    db.cleanup().await;
+}
+
 async fn test_app(database_url: &str) -> Router {
     let pool = db::connect(database_url).await.unwrap();
     db::init_schema(&pool).await.unwrap();
@@ -743,6 +849,7 @@ async fn test_app(database_url: &str) -> Router {
         registry_admin_token: Some("registry-secret".to_string()),
         bootstrap_registry_urls: Vec::new(),
         gateway_identity: None,
+        gateway_network: None,
     })
 }
 
@@ -770,6 +877,7 @@ async fn test_app_with_identity(database_url: &str) -> Router {
         registry_admin_token: Some("registry-secret".to_string()),
         bootstrap_registry_urls: Vec::new(),
         gateway_identity,
+        gateway_network: None,
     })
 }
 
@@ -800,6 +908,34 @@ async fn test_app_with_identity_and_bootstrap(
         registry_admin_token: Some("registry-secret".to_string()),
         bootstrap_registry_urls,
         gateway_identity,
+        gateway_network: None,
+    })
+}
+
+async fn test_app_with_network(database_url: &str) -> Router {
+    let pool = db::connect(database_url).await.unwrap();
+    db::init_schema(&pool).await.unwrap();
+    let runtime = GatewayNetworkRuntime::new(
+        GatewayNetworkNode::generate(wattetheria_gateway::config::GatewayP2pConfig {
+            enabled: true,
+            listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_string()],
+            ..Default::default()
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let gateway_network = runtime
+        .export_info(chrono::Utc::now().timestamp() as u64)
+        .unwrap();
+    http::router(AppState {
+        pool,
+        node_client: NodeClient::new(5).unwrap(),
+        registry_client: RegistryClient::new(5).unwrap(),
+        nats: None,
+        registry_admin_token: Some("registry-secret".to_string()),
+        bootstrap_registry_urls: Vec::new(),
+        gateway_identity: None,
+        gateway_network: Some(gateway_network),
     })
 }
 
@@ -975,7 +1111,7 @@ async fn ensure_postgres() {
 
 fn test_database_url() -> String {
     std::env::var("WATTETHERIA_GATEWAY_TEST_DATABASE_URL").unwrap_or_else(|_| {
-        "postgres://postgres:postgres@127.0.0.1:55433/wattetheria_gateway".to_string()
+        "postgres://postgres:postgres@127.0.0.1:55434/wattetheria_gateway".to_string()
     })
 }
 
@@ -992,6 +1128,8 @@ fn admin_database_url(base_url: &str) -> String {
 }
 
 struct SnapshotContents<'a> {
+    network_name: Option<&'a str>,
+    network_org_name: Option<&'a str>,
     peers: &'a [Value],
     public_topics: &'a [Value],
     public_topic_messages: &'a [Value],
@@ -1016,6 +1154,8 @@ fn signed_snapshot_at(
         generated_at,
         node_id: node_id.to_string(),
         public_key: public_key.clone(),
+        network_name: contents.network_name.map(str::to_string),
+        network_org_name: contents.network_org_name.map(str::to_string),
         network_status: json!({
             "total_nodes": contents.peers.len() + 1,
             "active_nodes": contents.peers.len() + 1,

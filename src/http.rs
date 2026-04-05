@@ -1,4 +1,5 @@
 use crate::db;
+use crate::gateway_network::GatewayNetworkInfo;
 use crate::models::{
     BootstrapRegistryEntry, DiscoveredGatewayEntry, GatewayRegistryQuery, ListQuery,
     RegisterGatewayRequest, RegisterGatewayResponse, RegisterNodeRequest, RegisterNodeResponse,
@@ -18,6 +19,7 @@ use axum::{
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
+use wattswarm_network_transport_core::{PeerTransportCapabilities, TransferIntent, TransferKind};
 
 pub fn router(state: AppState) -> Router {
     Router::new()
@@ -81,11 +83,27 @@ async fn register_node(
     let source_id = Uuid::new_v4();
     match db::insert_node_source(
         &state.pool,
-        source_id,
-        body.name.trim(),
-        body.export_url.trim(),
-        body.region.as_deref(),
-        body.expected_signer_agent_did.as_deref(),
+        db::InsertNodeSourceRecord {
+            id: source_id,
+            name: body.name.trim(),
+            export_url: body.export_url.trim(),
+            region: body.region.as_deref(),
+            expected_signer_agent_did: body.expected_signer_agent_did.as_deref(),
+            transport_capabilities: body
+                .transport_capabilities
+                .as_ref()
+                .map(serde_json::to_value)
+                .transpose()
+                .unwrap_or(None)
+                .as_ref(),
+            transport_contact_material: body
+                .transport_contact_material
+                .as_ref()
+                .map(serde_json::to_value)
+                .transpose()
+                .unwrap_or(None)
+                .as_ref(),
+        },
     )
     .await
     {
@@ -663,11 +681,16 @@ async fn list_nodes(State(state): State<AppState>) -> Response {
                         "last_sync_at": source.last_sync_at,
                         "last_sync_status": source.last_sync_status,
                         "last_error": source.last_error,
+                        "transport_capabilities": source.transport_capabilities.as_ref().map(|value| json!(value.0)),
+                        "transport_contact_material": source.transport_contact_material.as_ref().map(|value| json!(value.0)),
+                        "recommended_routes": source.transport_capabilities.as_ref().map(|value| recommended_routes(&value.0)),
                         "snapshot": snapshot.map(|row| json!({
                             "node_id": row.node_id,
                             "signer_agent_did": row.signer_agent_did,
                             "generated_at": row.generated_at,
                             "ingested_at": row.ingested_at,
+                            "network_name": row.payload.0["network_name"],
+                            "network_org_name": row.payload.0["network_org_name"],
                         })),
                     })
                 })
@@ -685,11 +708,16 @@ async fn list_nodes(State(state): State<AppState>) -> Response {
                                 "last_sync_at": row.ingested_at,
                                 "last_sync_status": "push",
                                 "last_error": Value::Null,
+                                "transport_capabilities": Value::Null,
+                                "transport_contact_material": Value::Null,
+                                "recommended_routes": Value::Null,
                                 "snapshot": {
                                     "node_id": row.node_id,
                                     "signer_agent_did": row.signer_agent_did,
                                     "generated_at": row.generated_at,
                                     "ingested_at": row.ingested_at,
+                                    "network_name": row.payload.0["network_name"],
+                                    "network_org_name": row.payload.0["network_org_name"],
                                 },
                             })
                         }),
@@ -744,6 +772,8 @@ async fn network_status(State(state): State<AppState>) -> Response {
     match db::list_snapshots(&state.pool).await {
         Ok(rows) => {
             let snapshots = rows.iter().map(|row| &row.payload.0).collect::<Vec<_>>();
+            let network_name = single_shared_string(&snapshots, "network_name");
+            let network_org_name = single_shared_string(&snapshots, "network_org_name");
             let total_nodes = snapshots.len();
             let total_peers = snapshots
                 .iter()
@@ -777,6 +807,9 @@ async fn network_status(State(state): State<AppState>) -> Response {
                 "organizations": total_organizations,
                 "topics": total_topics,
                 "topic_messages": total_topic_messages,
+                "network_name": network_name,
+                "network_org_name": network_org_name,
+                "gateway_runtime": state.gateway_network.as_ref().map(gateway_runtime_status),
                 "updated_at": db::now_rfc3339(),
             }))
             .into_response()
@@ -786,6 +819,71 @@ async fn network_status(State(state): State<AppState>) -> Response {
             Json(json!({"error": error.to_string()})),
         )
             .into_response(),
+    }
+}
+
+fn gateway_runtime_status(runtime: &GatewayNetworkInfo) -> Value {
+    json!({
+        "peer_id": runtime.peer_id,
+        "listen_addrs": runtime.listen_addrs,
+        "transport_capabilities": runtime.transport_capabilities,
+        "transport_contact_material": runtime.transport_contact_material,
+        "nat_status": runtime.nat_status,
+        "nat_public_address": runtime.nat_public_address,
+        "nat_confidence": runtime.nat_confidence,
+        "relay_reservations": runtime.relay_reservations,
+        "peer_health": runtime.peer_health.iter().map(|entry| json!({
+            "peer": entry.peer,
+            "score": entry.score,
+            "blacklisted": entry.blacklisted,
+            "reputation_tier": entry.reputation_tier,
+            "quarantined": entry.quarantined,
+            "quarantine_remaining_ms": entry.quarantine_remaining_ms,
+            "ban_remaining_ms": entry.ban_remaining_ms,
+            "throttle_factor_percent": entry.throttle_factor_percent,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+fn recommended_routes(capabilities: &PeerTransportCapabilities) -> Value {
+    json!({
+        "control_message": route_for(capabilities, TransferKind::ControlMessage, 512, false),
+        "backfill_chunk": route_for(capabilities, TransferKind::BackfillChunk, 128 * 1024, false),
+        "artifact_blob": route_for(capabilities, TransferKind::ArtifactBlob, 128 * 1024, true),
+        "checkpoint_snapshot": route_for(capabilities, TransferKind::CheckpointSnapshot, 128 * 1024, true),
+    })
+}
+
+fn route_for(
+    capabilities: &PeerTransportCapabilities,
+    kind: TransferKind,
+    payload_bytes: usize,
+    requires_streaming: bool,
+) -> &'static str {
+    wattswarm_network_transport_core::TransportRouter::select(
+        &TransferIntent {
+            kind,
+            payload_bytes,
+            requires_streaming,
+        },
+        Some(capabilities),
+    )
+    .as_str()
+}
+
+fn single_shared_string(snapshots: &[&Value], key: &str) -> Value {
+    let mut values = snapshots
+        .iter()
+        .filter_map(|payload| payload[key].as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    values.sort();
+    values.dedup();
+    match values.as_slice() {
+        [value] => Value::String(value.clone()),
+        _ => Value::Null,
     }
 }
 

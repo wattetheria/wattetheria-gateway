@@ -2,8 +2,8 @@ use anyhow::Context;
 use async_nats::ConnectOptions;
 use tracing::{info, warn};
 use wattetheria_gateway::{
-    config::Config, db, gateway_identity::GatewayIdentity, http, node_client, registry_client,
-    state::AppState,
+    config::Config, db, gateway_identity::GatewayIdentity, gateway_network, http, node_client,
+    registry_client, state::AppState,
 };
 
 #[tokio::main]
@@ -18,6 +18,23 @@ async fn main() -> anyhow::Result<()> {
     let config = Config::from_env()?;
     let gateway_identity = GatewayIdentity::from_config(config.gateway_identity.clone())
         .context("load gateway identity")?;
+    let gateway_network_runtime = if config.p2p.enabled {
+        info!("starting gateway shared p2p runtime");
+        Some(
+            gateway_network::GatewayNetworkRuntime::new(
+                gateway_network::GatewayNetworkNode::generate(config.p2p.clone())
+                    .context("generate gateway p2p node")?,
+            )
+            .context("start gateway p2p runtime")?,
+        )
+    } else {
+        None
+    };
+    let gateway_network = gateway_network_runtime
+        .as_ref()
+        .map(|runtime| runtime.export_info(chrono::Utc::now().timestamp() as u64))
+        .transpose()
+        .context("export gateway p2p info")?;
     let pool = db::connect(&config.database_url)
         .await
         .context("connect postgres")?;
@@ -47,6 +64,7 @@ async fn main() -> anyhow::Result<()> {
         registry_admin_token: config.registry_admin_token,
         bootstrap_registry_urls: config.bootstrap_registry_urls,
         gateway_identity,
+        gateway_network,
     };
     let app = http::router(app_state);
 

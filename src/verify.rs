@@ -142,6 +142,8 @@ mod tests {
             generated_at: 1_710_000_000,
             node_id: "node-alpha".to_string(),
             public_key: public_key.clone(),
+            network_name: None,
+            network_org_name: None,
             network_status: json!({"total_nodes": 2, "active_nodes": 2, "health_percent": 100, "avg_latency_ms": 0}),
             peers: vec![json!({"id":"peer-1"})],
             operator: json!({"id":"agent-root","display_name":"Agent Root"}),

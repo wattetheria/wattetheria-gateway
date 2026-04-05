@@ -1,4 +1,5 @@
 use crate::gateway_identity::GatewayIdentity;
+use crate::gateway_network::GatewayNetworkInfo;
 use crate::node_client::NodeClient;
 use crate::registry_client::RegistryClient;
 use anyhow::Result;
@@ -15,6 +16,7 @@ pub struct AppState {
     pub registry_admin_token: Option<String>,
     pub bootstrap_registry_urls: Vec<String>,
     pub gateway_identity: Option<GatewayIdentity>,
+    pub gateway_network: Option<GatewayNetworkInfo>,
 }
 
 impl AppState {
